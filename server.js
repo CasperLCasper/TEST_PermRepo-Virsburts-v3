@@ -543,24 +543,66 @@ async function readJsonResponseWithLimit(response, maxBytes) {
 
 async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchImpl = fetch) {
     const responseId = response.headers.get('x-ar-io-data-id');
-    const rootTxId = response.headers.get('x-ar-io-root-transaction-id');
-    const offsetText = response.headers.get('x-ar-io-root-item-offset');
-    const sizeText = response.headers.get('x-ar-io-root-item-size');
-    if (responseId !== manifestId || !validateArweaveId(rootTxId) ||
-        !/^\d+$/.test(offsetText || '') || !/^\d+$/.test(sizeText || '')) {
-        throw new Error('Vārteja nesniedz pietiekamus ANS-104 datus manifesta autentiskuma pārbaudei.');
+    if (responseId !== manifestId) {
+        throw new Error('Vārtejas atdotā manifesta ID neatbilst pieprasītajam ID.');
     }
 
-    const offset = Number(offsetText);
-    const itemSize = Number(sizeText);
-    // DataItem header/signature/tags add overhead; keep it bounded independently of the data body.
-    const maxItemBytes = MAX_MANIFEST_BYTES + 256 * 1024;
-    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(itemSize) ||
-        itemSize <= 0 || itemSize > maxItemBytes || !Number.isSafeInteger(offset + itemSize - 1)) {
-        throw new Error('ANS-104 manifesta transakcijas atrašanās vieta vai izmērs nav derīgs.');
+    // AR.IO versijas atšķirīgi atklāj ANS-104 atrašanās vietu. Dažas atbildes
+    // satur X-AR-IO-Root-Item-* galvenes, citas — tikai root transaction ID.
+    // Galvenes ir tikai atrašanās vietas norāde; autentiskumu pierāda DataItem
+    // paraksts, datu vienuma ID un precīza satura salīdzinājums zemāk.
+    let rootTxId = response.headers.get('x-ar-io-root-transaction-id');
+    let offsetText = response.headers.get('x-ar-io-root-item-offset') ||
+        response.headers.get('x-ar-io-root-data-item-offset');
+    let sizeText = response.headers.get('x-ar-io-root-item-size');
+
+    const parseLocation = () => {
+        if (!validateArweaveId(rootTxId) || !/^\d+$/.test(offsetText || '') || !/^\d+$/.test(sizeText || '')) {
+            return null;
+        }
+        const offset = Number(offsetText);
+        const itemSize = Number(sizeText);
+        const maxItemBytes = MAX_MANIFEST_BYTES + 256 * 1024;
+        if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(itemSize) ||
+            itemSize <= 0 || itemSize > maxItemBytes || !Number.isSafeInteger(offset + itemSize - 1)) {
+            return null;
+        }
+        return { rootTxId, offset, itemSize, maxItemBytes };
+    };
+
+    let location = parseLocation();
+    if (!location) {
+        // Fallback oficiālajam AR.IO offsets endpoint. Tas dod rootTxId,
+        // rootOffset un size; šie dati netiek uzticēti kā autentiskuma pierādījums,
+        // tie tikai ļauj atrast DataItem baitu diapazonu, ko pēc tam kriptogrāfiski pārbaudām.
+        const gatewayOrigin = new URL(getValidatedManifestUrl(manifestId)).origin;
+        const offsetsUrl = `${gatewayOrigin}/ar-io/offsets/${encodeURIComponent(manifestId)}`;
+        const offsetsResponse = await fetchImpl(offsetsUrl, {
+            cache: 'no-store',
+            redirect: 'error',
+            signal: AbortSignal.timeout(30000),
+            headers: { Accept: 'application/json' }
+        });
+        if (!offsetsResponse.ok) {
+            try { await offsetsResponse.body?.cancel(); } catch {}
+            throw new Error('Vārteja nenodrošināja ANS-104 atrašanās vietu; offsets pieprasījums neizdevās.');
+        }
+        const offsetsBytes = await readResponseBytesWithLimit(offsetsResponse, 64 * 1024, 'ANS-104 offsets atbilde');
+        let offsets;
+        try { offsets = JSON.parse(offsetsBytes.toString('utf8')); }
+        catch { throw new Error('Vārtejas ANS-104 offsets atbilde nav derīgs JSON.'); }
+
+        rootTxId = offsets?.rootTxId;
+        offsetText = String(offsets?.rootOffset ?? '');
+        sizeText = String(offsets?.size ?? '');
+        location = parseLocation();
+        if (!location) {
+            throw new Error('Vārteja nesniedz derīgu ANS-104 atrašanās vietu manifesta autentiskuma pārbaudei.');
+        }
     }
 
-    const rootUrl = getValidatedManifestUrl(rootTxId);
+    const { offset, itemSize, maxItemBytes } = location;
+    const rootUrl = getValidatedManifestUrl(location.rootTxId);
     const itemResponse = await fetchImpl(rootUrl, {
         cache: 'no-store',
         redirect: 'error',

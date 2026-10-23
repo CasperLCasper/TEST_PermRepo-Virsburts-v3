@@ -110,19 +110,36 @@ test('P12 — iepriekšējā manifesta atbilde tiek ierobežota pirms JSON pars�
   assert.match(source, /async function readJsonResponseWithLimit\(response, maxBytes\)/);
   assert.match(source, /totalBytes \+= value\.byteLength/);
   assert.match(source, /totalBytes > maxBytes/);
-  assert.match(source, /readJsonResponseWithLimit\(response, MAX_MANIFEST_BYTES\)/);
+  assert.match(source, /readResponseBytesWithLimit\(response, MAX_MANIFEST_BYTES, 'Iepriekšējais manifests'\)/);
   assert.doesNotMatch(source, /const manifest = await response\.json\(\)/);
 });
 
 test('P13 — limita funkcija noraida pārāk lielu manifesta atbildi pirms parsēšanas', async () => {
   const source = read('server.js');
-  const start = source.indexOf('async function readJsonResponseWithLimit(response, maxBytes) {');
-  const end = source.indexOf('\nasync function loadPreviousManifest', start);
+  const start = source.indexOf("async function readResponseBytesWithLimit(response, maxBytes, label = 'Manifests') {");
+  const end = source.indexOf('\nasync function readJsonResponseWithLimit', start);
   assert.ok(start >= 0 && end > start, 'Nav atrasta manifesta izmēra limita funkcija.');
   const readLimited = new Function('Buffer', `return (${source.slice(start, end)});`)(Buffer);
   await assert.rejects(
-    readLimited(new Response(JSON.stringify({ payload: 'x'.repeat(100) })), 20),
+    readLimited(new Response('x'.repeat(100)), 20, 'Iepriekšējais manifests'),
     /pārsniedz maksimālo izmēru/
   );
-  assert.deepEqual(await readLimited(new Response('{"ok":true}'), 20), { ok: true });
+  assert.equal((await readLimited(new Response('{"ok":true}'), 20)).toString('utf8'), '{"ok":true}');
+});
+
+
+test('P14 — iepriekšējā manifesta saturs tiek pārbaudīts pret parakstīto ANS-104 datu vienumu', () => {
+  const source = read('server.js');
+  assert.match(source, /import \{ DataItem \} from '@dha-team\/arbundles';/);
+  const start = source.indexOf('async function verifyArweaveDataItem(');
+  const end = source.indexOf('\nasync function loadPreviousManifest', start);
+  assert.ok(start >= 0 && end > start, 'Nav atrasta ANS-104 autentiskuma pārbaude.');
+  const verifier = source.slice(start, end);
+  assert.match(verifier, /x-ar-io-root-transaction-id/);
+  assert.match(verifier, /x-ar-io-root-item-offset/);
+  assert.match(verifier, /x-ar-io-root-item-size/);
+  assert.match(verifier, /Range:/);
+  assert.match(verifier, /await item\.isValid\(\)/);
+  assert.match(verifier, /item\.id !== manifestId/);
+  assert.match(verifier, /item\.rawData\)\.equals\(manifestBytes\)/);
 });

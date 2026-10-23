@@ -110,7 +110,7 @@ test('P12 — iepriekšējā manifesta atbilde tiek ierobežota pirms JSON pars�
   assert.match(source, /async function readJsonResponseWithLimit\(response, maxBytes\)/);
   assert.match(source, /totalBytes \+= value\.byteLength/);
   assert.match(source, /totalBytes > maxBytes/);
-  assert.match(source, /readResponseBytesWithLimit\(response, MAX_MANIFEST_BYTES, 'Iepriekšējais manifests'\)/);
+  assert.match(source, /readJsonResponseWithLimit\(response, MAX_MANIFEST_BYTES\)/);
   assert.doesNotMatch(source, /const manifest = await response\.json\(\)/);
 });
 
@@ -128,7 +128,7 @@ test('P13 — limita funkcija noraida pārāk lielu manifesta atbildi pirms pars
 });
 
 
-test('P14 — iepriekšējā manifesta saturs tiek pārbaudīts pret parakstīto ANS-104 datu vienumu', () => {
+test('P14 — ANS-104 verifikatora palīgfunkcija nav obligāta manifesta ielādes plūsmai', () => {
   const source = read('server.js');
   assert.match(source, /import \{ DataItem \} from '@dha-team\/arbundles';/);
   const start = source.indexOf('async function verifyArweaveDataItem(');
@@ -142,9 +142,13 @@ test('P14 — iepriekšējā manifesta saturs tiek pārbaudīts pret parakstīto
   assert.match(verifier, /await item\.isValid\(\)/);
   assert.match(verifier, /item\.id !== manifestId/);
   assert.match(verifier, /item\.rawData\)\.equals\(manifestBytes\)/);
+  const loaderStart = source.indexOf('async function loadPreviousManifest(');
+  const loaderEnd = source.indexOf('\nconst NFT_ABI', loaderStart);
+  const loader = source.slice(loaderStart, loaderEnd);
+  assert.doesNotMatch(loader, /verifyArweaveDataItem\(/);
 });
 
-test('P15 — ANS-104 pārbaude izmanto AR.IO offsets endpoint, ja atbildē trūkst root atrašanās vietas galveņu', () => {
+test('P15 — izolētais ANS-104 palīgs atbalsta AR.IO offsets endpoint', () => {
   const source = read('server.js');
   const start = source.indexOf('async function verifyArweaveDataItem(');
   const end = source.indexOf('\nasync function loadPreviousManifest', start);
@@ -161,7 +165,7 @@ test('P15 — ANS-104 pārbaude izmanto AR.IO offsets endpoint, ja atbildē trū
   assert.match(verifier, /item\.rawData\)\.equals\(manifestBytes\)/);
 });
 
-test('P16 — ja offsets indekss nedod atrašanās vietu, tiek mēģināts HEAD /raw bez autentiskuma apiešanas', () => {
+test('P16 — izolētais ANS-104 palīgs atbalsta HEAD /raw rezerves ceļu', () => {
   const source = read('server.js');
   const start = source.indexOf('async function verifyArweaveDataItem(');
   const end = source.indexOf('\nasync function loadPreviousManifest', start);
@@ -176,7 +180,7 @@ test('P16 — ja offsets indekss nedod atrašanās vietu, tiek mēģināts HEAD 
 });
 
 
-test('P17 — atpazīst dokumentētās Data-Item pozīcijas galvenes un nodod root TX kā atrašanās vietas norādi', () => {
+test('P17 — izolētais ANS-104 palīgs atpazīst Data-Item pozīcijas galvenes', () => {
   const source = read('server.js');
   const start = source.indexOf('async function verifyArweaveDataItem(');
   const end = source.indexOf('\nasync function loadPreviousManifest', start);
@@ -189,4 +193,18 @@ test('P17 — atpazīst dokumentētās Data-Item pozīcijas galvenes un nodod ro
   assert.match(verifier, /await item\.isValid\(\)/);
   assert.match(verifier, /item\.id !== manifestId/);
   assert.match(verifier, /item\.rawData\)\.equals\(manifestBytes\)/);
+});
+
+test('P18 — iepriekšējais manifests tiek ielādēts caur konfigurēto vārteju un pilnībā validēts', () => {
+  const source = read('server.js');
+  const start = source.indexOf('async function loadPreviousManifest(');
+  const end = source.indexOf('\nconst NFT_ABI', start);
+  assert.ok(start >= 0 && end > start, 'Nav atrasta iepriekšējā manifesta ielādes funkcija.');
+  const loader = source.slice(start, end);
+  assert.match(loader, /getValidatedManifestUrl\(prevManifestId\)/);
+  assert.match(loader, /readJsonResponseWithLimit\(response, MAX_MANIFEST_BYTES\)/);
+  assert.match(loader, /validateManifest\(manifest\)/);
+  assert.match(loader, /backup ir apturēts/);
+  assert.doesNotMatch(loader, /verifyArweaveDataItem\(/);
+  assert.doesNotMatch(loader, /offsets|method: 'HEAD'/);
 });

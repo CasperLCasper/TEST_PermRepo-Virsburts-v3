@@ -143,3 +143,20 @@ test('P14 — iepriekšējā manifesta saturs tiek pārbaudīts pret parakstīto
   assert.match(verifier, /item\.id !== manifestId/);
   assert.match(verifier, /item\.rawData\)\.equals\(manifestBytes\)/);
 });
+
+test('P15 — ANS-104 pārbaude izmanto AR.IO offsets endpoint, ja atbildē trūkst root atrašanās vietas galveņu', () => {
+  const source = read('server.js');
+  const start = source.indexOf('async function verifyArweaveDataItem(');
+  const end = source.indexOf('\nasync function loadPreviousManifest', start);
+  assert.ok(start >= 0 && end > start, 'Nav atrasta ANS-104 autentiskuma pārbaude.');
+  const verifier = source.slice(start, end);
+  assert.match(verifier, /\/ar-io\/offsets\//);
+  assert.match(verifier, /offsets\?\.rootTxId/);
+  assert.match(verifier, /offsets\?\.rootOffset/);
+  assert.match(verifier, /offsets\?\.size/);
+  assert.match(verifier, /redirect: 'error'/);
+  assert.match(verifier, /DataItem\.verify\(rawItem\)/);
+  assert.match(verifier, /await item\.isValid\(\)/);
+  assert.match(verifier, /item\.id !== manifestId/);
+  assert.match(verifier, /item\.rawData\)\.equals\(manifestBytes\)/);
+});

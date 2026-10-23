@@ -7,7 +7,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "start": "node server.js",
-    "test": "node --test tests/*.test.js",
+    "test": "node --test tests/backup.test.js tests/integration.test.js tests/platform.test.js",
     "test:backup": "node --test tests/backup.test.js tests/integration.test.js",
     "test:platform": "node --test tests/platform.test.js"
   },

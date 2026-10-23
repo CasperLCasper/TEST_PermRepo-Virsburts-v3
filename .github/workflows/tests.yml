@@ -1,22 +1,17 @@
-name: PermRepo tests
+name: PermRepo backup audit tests
 
 on:
   push:
   pull_request:
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 jobs:
-  test:
+  backup-audit-tests:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout test repository
-        uses: actions/checkout@v4
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: 22
-      - name: Run tests
+          node-version: 20
+      - name: Run backup audit tests
         run: npm test

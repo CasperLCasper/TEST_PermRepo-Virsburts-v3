@@ -54,9 +54,24 @@ export function makeBackupValidator(source = backupSource) {
 }
 
 export function extractB06Guard(source = backupSource) {
-  const startMarker = '// B06: piesaista manifestu tieši GitHub repozitorijam,';
-  const endMarker = '\n            if (!job.zipTxId)';
-  const guard = extractBetween(source, startMarker, endMarker);
+  const routeStart = source.indexOf("app.post('/api/save-manifest-tx'");
+  if (routeStart < 0) throw new Error('Nav atrasts /api/save-manifest-tx maršruts.');
+  const routeEndCandidates = [
+    source.indexOf('app.post(', routeStart + 10),
+    source.indexOf('app.get(', routeStart + 10),
+    source.indexOf('app.put(', routeStart + 10),
+    source.indexOf('app.delete(', routeStart + 10)
+  ].filter(i => i >= 0);
+  const route = source.slice(routeStart, routeEndCandidates.length ? Math.min(...routeEndCandidates) : source.length);
+  const repoId = route.match(/(?:const|let)\s+manifestRepositoryId\s*=\s*String\(manifest\.metadata\.repositoryId\);?/);
+  const jobId = route.match(/(?:const|let)\s+jobRepositoryId\s*=\s*String\(job\.githubRepositoryId(?:\s*\?\?\s*['"]{2})?\);?/);
+  if (!repoId || !jobId || !/BigInt\(manifestRepositoryId\)\s*!==\s*BigInt\(jobRepositoryId\)/.test(route)) {
+    throw new Error('Trūkst reālas manifest.metadata.repositoryId un job.githubRepositoryId salīdzināšanas pārbaudes maršrutā /api/save-manifest-tx.');
+  }
+  const guardStart = route.indexOf(repoId[0]);
+  const zipStart = route.indexOf('if (!job.zipTxId)', guardStart);
+  if (zipStart < 0) throw new Error('Maršrutā nav atrasta ZIP statusa pārbaude pēc repositoryId sasaistes.');
+  const guard = route.slice(guardStart, zipStart);
   return new Function('manifest', 'job', `${guard}\nreturn true;`);
 }
 

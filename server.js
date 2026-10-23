@@ -552,9 +552,14 @@ async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchI
     // Galvenes ir tikai atrašanās vietas norāde; autentiskumu pierāda DataItem
     // paraksts, datu vienuma ID un precīza satura salīdzinājums zemāk.
     let rootTxId = response.headers.get('x-ar-io-root-transaction-id');
-    let offsetText = response.headers.get('x-ar-io-root-item-offset') ||
-        response.headers.get('x-ar-io-root-data-item-offset');
-    let sizeText = response.headers.get('x-ar-io-root-item-size');
+    // AR.IO dokumentācijā standarta pozīcijas galvenes ir Data-Item-*;
+    // dažas versijas/vārtejas joprojām atgriež Root-Item-* vai Root-Data-*.
+    let offsetText = response.headers.get('x-ar-io-data-item-offset') ||
+        response.headers.get('x-ar-io-root-item-offset') ||
+        response.headers.get('x-ar-io-root-data-item-offset') ||
+        response.headers.get('x-ar-io-root-data-offset');
+    let sizeText = response.headers.get('x-ar-io-data-item-size') ||
+        response.headers.get('x-ar-io-root-item-size');
 
     const parseLocation = () => {
         if (!validateArweaveId(rootTxId) || !/^\d+$/.test(offsetText || '') || !/^\d+$/.test(sizeText || '')) {
@@ -613,17 +618,26 @@ async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchI
                     cache: 'no-store',
                     redirect: 'error',
                     signal: AbortSignal.timeout(30000),
-                    headers: { Accept: 'application/octet-stream' }
+                    headers: {
+                        Accept: 'application/octet-stream',
+                        // Ja sākotnējā atbilde jau atklāja root TX ID, dodam to
+                        // kā dokumentētu norādi, lai vārtejai nav jāsāk no nulles.
+                        ...(validateArweaveId(rootTxId)
+                            ? { 'X-AR-IO-Root-Transaction-Id': rootTxId }
+                            : {})
+                    }
                 });
             } catch (error) {
                 throw new Error(`Vārteja nenodrošināja ANS-104 atrašanās vietu: offsets (${offsetsError || 'nederīga atbilde'}) un HEAD /raw pieprasījums neizdevās (${error?.name === 'TimeoutError' ? 'taimauts' : 'tīkla kļūda'}).`);
             }
             if (headResponse.ok) {
-                rootTxId = headResponse.headers.get('x-ar-io-root-transaction-id');
-                offsetText = headResponse.headers.get('x-ar-io-root-item-offset') ||
-                    headResponse.headers.get('x-ar-io-root-data-item-offset');
-                sizeText = headResponse.headers.get('x-ar-io-root-item-size') ||
-                    headResponse.headers.get('x-ar-io-data-item-size');
+                rootTxId = headResponse.headers.get('x-ar-io-root-transaction-id') || rootTxId;
+                offsetText = headResponse.headers.get('x-ar-io-data-item-offset') ||
+                    headResponse.headers.get('x-ar-io-root-item-offset') ||
+                    headResponse.headers.get('x-ar-io-root-data-item-offset') ||
+                    headResponse.headers.get('x-ar-io-root-data-offset');
+                sizeText = headResponse.headers.get('x-ar-io-data-item-size') ||
+                    headResponse.headers.get('x-ar-io-root-item-size');
                 location = parseLocation();
             }
             try { await headResponse?.body?.cancel(); } catch {}

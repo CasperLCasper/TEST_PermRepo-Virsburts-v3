@@ -2,34 +2,85 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { root, backupSource } from './helpers.js';
+import { root, backupSource, routeSource } from './helpers.js';
 
-test('I01 — atrodamas backup platformas būtiskās avota mapes un faili', () => {
+const manifestRoute = routeSource("app.post('/api/save-manifest-tx'");
+
+test('I01 — backup platformas kritiskie faili atrodas repozitorijā', () => {
   for (const file of [
-    'server.js',
-    'accounting-redis.js',
-    'src/BackupPage.jsx',
-    'public/contracts/50-4-PermRepoNFT.sol',
-    'public/contracts/10-PermRepo-Subscription.sol'
-  ]) {
-    assert.equal(fs.existsSync(path.join(root, file)), true, `Trūkst backup platformas faila: ${file}`);
-  }
+    'server.js', 'accounting-redis.js', 'src/BackupPage.jsx',
+    'public/contracts/50-4-PermRepoNFT.sol', 'public/contracts/10-PermRepo-Subscription.sol'
+  ]) assert.ok(fs.existsSync(path.join(root, file)), `Trūkst backup platformas faila: ${file}`);
 });
 
-test('I02 — save-manifest-tx validē manifestu pirms tā izmantošanas', () => {
-  const routeStart = backupSource.indexOf("app.post('/api/save-manifest-tx'");
-  assert.ok(routeStart >= 0, 'Nav atrasts /api/save-manifest-tx maršruts.');
-  const routeEnd = backupSource.indexOf('app.post(', routeStart + 10);
-  const route = backupSource.slice(routeStart, routeEnd === -1 ? undefined : routeEnd);
-  assert.ok(route.indexOf('validateManifest(manifest)') >= 0,
-    'save-manifest-tx maršrutam jāvalidē manifests pirms tā saglabāšanas.');
+test('I02 — save-manifest-tx validē ievadi un manifestu pirms job stāvokļa maiņas', () => {
+  const inputValidation = manifestRoute.indexOf('validateJobTxInput(jobId, manifestTxId)');
+  const manifestValidation = manifestRoute.indexOf('validateManifest(manifest)');
+  const lock = manifestRoute.indexOf('withJobLock(jobId');
+  assert.ok(inputValidation >= 0, 'Trūkst job/transakcijas ID validācijas.');
+  assert.ok(manifestValidation > inputValidation, 'Manifests jāvalidē pēc ievades nolasīšanas.');
+  assert.ok(lock > manifestValidation, 'Job lock/stāvokļa apstrāde sākas pirms manifesta validācijas.');
 });
 
-test('I03 — save-manifest-tx pārbauda, ka manifesta archive.id sakrīt ar ZIP transakcijas ID', () => {
-  const routeStart = backupSource.indexOf("app.post('/api/save-manifest-tx'");
-  assert.ok(routeStart >= 0, 'Nav atrasts /api/save-manifest-tx maršruts.');
-  const routeEnd = backupSource.indexOf('app.post(', routeStart + 10);
-  const route = backupSource.slice(routeStart, routeEnd === -1 ? undefined : routeEnd);
-  assert.match(route, /manifest\.archive\?\.id\s*!==\s*job\.zipTxId/,
-    'Nav atrasta manifesta archive.id un job.zipTxId sakritības pārbaude.');
+test('I03 — manifests tiek piesaistīts ZIP transakcijai gan parastajā, gan recovery plūsmā', () => {
+  assert.match(manifestRoute, /manifest\.archive\?\.id\s*!==\s*job\.zipTxId/,
+    'Trūkst archive.id un job.zipTxId sakritības pārbaudes.');
+  const matches = manifestRoute.match(/manifest\.archive\?\.id\s*!==\s*job\.zipTxId/g) ?? [];
+  assert.ok(matches.length >= 2, 'ZIP transakcijas pārbaudei jābūt gan recovery, gan parastajā plūsmā.');
+});
+
+test('I04 — repositoryId sasaistes pārbaude notiek pirms ZIP/manifesta stāvokļa izmaiņām', () => {
+  const repoBinding = manifestRoute.indexOf('manifestRepositoryId');
+  const zipRequired = manifestRoute.indexOf('if (!job.zipTxId)');
+  const update = manifestRoute.indexOf('await updateJob');
+  assert.ok(repoBinding >= 0, 'Nav atrasta repositoryId sasaistes pārbaude.');
+  assert.ok(zipRequired > repoBinding, 'ZIP statusa pārbaude apsteidz repositoryId sasaisti.');
+  assert.ok(update > repoBinding, 'Job var tikt atjaunināts pirms repositoryId sasaistes.');
+});
+
+test('I05 — manifestTx idempotence neļauj mainīt jau pabeigtu manifesta transakciju', () => {
+  assert.match(manifestRoute, /job\.status\s*===\s*'manifest-uploaded'/);
+  assert.match(manifestRoute, /job\.status\s*===\s*'blockchain-finalizing'/);
+  assert.match(manifestRoute, /job\.status\s*===\s*'completed'/);
+  assert.match(manifestRoute, /job\.manifestTxId\s*===\s*manifestTxId/);
+  assert.match(manifestRoute, /Nevar mainīt manifestu pēc statusa/);
+});
+
+test('I06 — recovery no failed statusa pārbauda ZIP ID pirms atjaunošanas', () => {
+  const recovery = manifestRoute.indexOf("job.status === 'failed'");
+  const zipCheck = manifestRoute.indexOf('manifest.archive?.id !== job.zipTxId', recovery);
+  const update = manifestRoute.indexOf("status: 'manifest-uploaded'", recovery);
+  assert.ok(recovery >= 0, 'Trūkst failed job recovery plūsmas.');
+  assert.ok(zipCheck > recovery && zipCheck < update, 'Recovery atjauno stāvokli pirms ZIP ID pārbaudes.');
+});
+
+test('I07 — piekļuves maršrutam ir same-origin un GitHub sesijas pārbaudes', () => {
+  assert.match(manifestRoute, /assertSameOrigin\(req\)/);
+  assert.match(manifestRoute, /requireGithubSession\(req, res\)/);
+  assert.match(manifestRoute, /verifyJobAuthorization\(req, job\)/);
+  assert.match(manifestRoute, /verifyJobNFTAuthorization/);
+});
+
+test('I08 — iepriekšējais manifests tiek validēts pirms inkrementālā backup lietošanas', () => {
+  const loaderStart = backupSource.indexOf('async function loadPreviousManifest(lastManifest) {');
+  const loaderEnd = backupSource.indexOf('\nconst NFT_ABI', loaderStart);
+  const loader = backupSource.slice(loaderStart, loaderEnd);
+  assert.match(loader, /validateManifest\(manifest\)/);
+  assert.ok(loader.indexOf('validateManifest(manifest)') < loader.indexOf('return manifest'));
+});
+
+test('I09 — avots nesatur acīmredzamu servera maksājumu wallet privāto atslēgu', () => {
+  assert.doesNotMatch(backupSource, /process\.env\.(?:PRIVATE_KEY|WALLET_PRIVATE_KEY)\s*\|\|\s*['"]0x[a-fA-F0-9]{64}['"]/);
+  assert.match(backupSource, /MINT_AUTHORIZATION_SIGNER_PRIVATE_KEY/,
+    'Sagaidāms atsevišķs mint autorizācijas parakstītāja konfigurācijas mainīgais.');
+});
+
+test('I10 — kritiskie maršruti un galvenās aizsardzības paliek avotā', () => {
+  for (const route of [
+    "app.post('/api/save-manifest-tx'",
+    "app.post('/api/",
+    'function validateManifest(manifest)',
+    'async function loadPreviousManifest(lastManifest)',
+    'validateJobTxInput(jobId, manifestTxId)'
+  ]) assert.ok(backupSource.includes(route), `Trūkst kritiska avota elementa: ${route}`);
 });

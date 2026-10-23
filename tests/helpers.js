@@ -2,11 +2,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// Tests run inside the actual backup-platform repository.
 export const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-export const backupRoot = path.join(root, 'fixtures', 'backup');
-export const restoreRoot = path.join(root, 'fixtures', 'restore');
-export const backupSource = fs.readFileSync(path.join(backupRoot, 'server.js'), 'utf8');
-export const restoreSource = fs.readFileSync(path.join(restoreRoot, 'restore.js'), 'utf8');
+export const backupRoot = root;
+export const backupSource = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
 
 export function extractBetween(source, startMarker, endMarker) {
   const start = source.indexOf(startMarker);
@@ -18,6 +17,7 @@ export function extractBetween(source, startMarker, endMarker) {
 
 export const AR_ID = 'A'.repeat(43);
 export const ZIP_ID = 'B'.repeat(43);
+
 export const validManifest = () => ({
   manifest: 'arweave/paths',
   version: '0.2.0',
@@ -43,13 +43,4 @@ export function makeBackupValidator() {
     id => typeof id === 'string' && /^[A-Za-z0-9_-]{43}$/.test(id),
     10 * 1024 * 1024
   );
-}
-
-export function makeRestoreValidator() {
-  const source = extractBetween(
-    restoreSource,
-    'function validateManifestStructure(manifest) {',
-    '\n/* ================================================== */\n/* Manifesta URI un hash palīgfunkcijas'
-  );
-  return new Function('t', `return (${source});`)(key => key);
 }

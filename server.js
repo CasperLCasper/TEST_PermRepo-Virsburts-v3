@@ -544,6 +544,17 @@ async function loadPreviousManifest(lastManifest) {
             return null;
         }
 
+        // ✅ B07 LABOJUMS: Validē iepriekšējo manifestu pirms tā izmantošanas
+        try {
+            validateManifest(manifest);
+        } catch (validationError) {
+            console.warn(
+                'Iepriekšējais manifests nav derīgs:',
+                errorMessage(validationError)
+            );
+            return null;
+        }
+
         return manifest;
     } catch (error) {
         console.warn(
@@ -2589,6 +2600,13 @@ app.post('/api/save-manifest-tx', backupLimiter, async (req, res) => {
 
             if (!job.zipTxId) {
                 throw new Error('ZIP transakcija vēl nav saglabāta.');
+            }
+
+            // ✅ B06 LABOJUMS: Pārbauda, vai manifesta repositoryId atbilst job repositoryId
+            if (String(manifest.metadata?.repositoryId) !== String(job.githubRepositoryId)) {
+                throw new Error(
+                    'Manifesta repositoryId nesakrīt ar backup job repositoryId.'
+                );
             }
 
             // ✅ Idempotence

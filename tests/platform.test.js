@@ -174,3 +174,19 @@ test('P16 — ja offsets indekss nedod atrašanās vietu, tiek mēģināts HEAD 
   assert.match(verifier, /DataItem\.verify\(rawItem\)/);
   assert.match(verifier, /await item\.isValid\(\)/);
 });
+
+
+test('P17 — atpazīst dokumentētās Data-Item pozīcijas galvenes un nodod root TX kā atrašanās vietas norādi', () => {
+  const source = read('server.js');
+  const start = source.indexOf('async function verifyArweaveDataItem(');
+  const end = source.indexOf('\nasync function loadPreviousManifest', start);
+  assert.ok(start >= 0 && end > start, 'Nav atrasta ANS-104 autentiskuma pārbaude.');
+  const verifier = source.slice(start, end);
+  assert.match(verifier, /x-ar-io-data-item-offset/);
+  assert.match(verifier, /x-ar-io-data-item-size/);
+  assert.match(verifier, /X-AR-IO-Root-Transaction-Id/);
+  assert.match(verifier, /DataItem\.verify\(rawItem\)/);
+  assert.match(verifier, /await item\.isValid\(\)/);
+  assert.match(verifier, /item\.id !== manifestId/);
+  assert.match(verifier, /item\.rawData\)\.equals\(manifestBytes\)/);
+});

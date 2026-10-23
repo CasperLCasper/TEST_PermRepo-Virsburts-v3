@@ -572,32 +572,64 @@ async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchI
 
     let location = parseLocation();
     if (!location) {
-        // Fallback oficiālajam AR.IO offsets endpoint. Tas dod rootTxId,
-        // rootOffset un size; šie dati netiek uzticēti kā autentiskuma pierādījums,
-        // tie tikai ļauj atrast DataItem baitu diapazonu, ko pēc tam kriptogrāfiski pārbaudām.
+        // 1) Lētais AR.IO offsets indekss. Ne visas vārtejas vai visi nesen
+        // augšupielādētie vienumi jau ir indeksēti, tāpēc 404 nav galīgā atbilde.
         const gatewayOrigin = new URL(getValidatedManifestUrl(manifestId)).origin;
-        const offsetsUrl = `${gatewayOrigin}/ar-io/offsets/${encodeURIComponent(manifestId)}`;
-        const offsetsResponse = await fetchImpl(offsetsUrl, {
-            cache: 'no-store',
-            redirect: 'error',
-            signal: AbortSignal.timeout(30000),
-            headers: { Accept: 'application/json' }
-        });
-        if (!offsetsResponse.ok) {
-            try { await offsetsResponse.body?.cancel(); } catch {}
-            throw new Error('Vārteja nenodrošināja ANS-104 atrašanās vietu; offsets pieprasījums neizdevās.');
+        let offsetsError = null;
+        try {
+            const offsetsUrl = `${gatewayOrigin}/ar-io/offsets/${encodeURIComponent(manifestId)}`;
+            const offsetsResponse = await fetchImpl(offsetsUrl, {
+                cache: 'no-store',
+                redirect: 'error',
+                signal: AbortSignal.timeout(15000),
+                headers: { Accept: 'application/json' }
+            });
+            if (offsetsResponse.ok) {
+                const offsetsBytes = await readResponseBytesWithLimit(offsetsResponse, 64 * 1024, 'ANS-104 offsets atbilde');
+                let offsets;
+                try { offsets = JSON.parse(offsetsBytes.toString('utf8')); }
+                catch { throw new Error('Vārtejas ANS-104 offsets atbilde nav derīgs JSON.'); }
+                rootTxId = offsets?.rootTxId;
+                offsetText = String(offsets?.rootOffset ?? '');
+                sizeText = String(offsets?.size ?? '');
+                location = parseLocation();
+            } else {
+                offsetsError = `HTTP ${offsetsResponse.status}`;
+                try { await offsetsResponse.body?.cancel(); } catch {}
+            }
+        } catch (error) {
+            offsetsError = error?.name === 'TimeoutError' ? 'taimauts' : 'tīkla kļūda';
         }
-        const offsetsBytes = await readResponseBytesWithLimit(offsetsResponse, 64 * 1024, 'ANS-104 offsets atbilde');
-        let offsets;
-        try { offsets = JSON.parse(offsetsBytes.toString('utf8')); }
-        catch { throw new Error('Vārtejas ANS-104 offsets atbilde nav derīgs JSON.'); }
 
-        rootTxId = offsets?.rootTxId;
-        offsetText = String(offsets?.rootOffset ?? '');
-        sizeText = String(offsets?.size ?? '');
-        location = parseLocation();
+        // 2) Oficiāli dokumentētais rezerves ceļš: HEAD /raw/{id}. Tas var
+        // palaist parasto vārtejas atrašanas ķēdi un atdot root/item galvenes.
+        // Galvenes ir tikai atrašanās vietas norāde; tās nekad neaizstāj
+        // DataItem paraksta, ID un precīza satura pārbaudi zemāk.
         if (!location) {
-            throw new Error('Vārteja nesniedz derīgu ANS-104 atrašanās vietu manifesta autentiskuma pārbaudei.');
+            let headResponse;
+            try {
+                headResponse = await fetchImpl(`${gatewayOrigin}/raw/${encodeURIComponent(manifestId)}`, {
+                    method: 'HEAD',
+                    cache: 'no-store',
+                    redirect: 'error',
+                    signal: AbortSignal.timeout(30000),
+                    headers: { Accept: 'application/octet-stream' }
+                });
+            } catch (error) {
+                throw new Error(`Vārteja nenodrošināja ANS-104 atrašanās vietu: offsets (${offsetsError || 'nederīga atbilde'}) un HEAD /raw pieprasījums neizdevās (${error?.name === 'TimeoutError' ? 'taimauts' : 'tīkla kļūda'}).`);
+            }
+            if (headResponse.ok) {
+                rootTxId = headResponse.headers.get('x-ar-io-root-transaction-id');
+                offsetText = headResponse.headers.get('x-ar-io-root-item-offset') ||
+                    headResponse.headers.get('x-ar-io-root-data-item-offset');
+                sizeText = headResponse.headers.get('x-ar-io-root-item-size') ||
+                    headResponse.headers.get('x-ar-io-data-item-size');
+                location = parseLocation();
+            }
+            try { await headResponse?.body?.cancel(); } catch {}
+        }
+        if (!location) {
+            throw new Error(`Vārteja nesniedza derīgu ANS-104 atrašanās vietu: offsets (${offsetsError || 'atrašanās vieta nav indeksēta'}) un HEAD /raw galvenes nav pietiekamas.`);
         }
     }
 

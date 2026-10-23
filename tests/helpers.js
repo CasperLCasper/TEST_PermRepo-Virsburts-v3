@@ -77,10 +77,12 @@ export function extractB06Guard(source = backupSource) {
 
 export function makePreviousManifestLoader({ source = backupSource, fetchImpl, validateManifest, warnings = [] } = {}) {
   const fn = extractBetween(source, 'async function loadPreviousManifest(lastManifest) {', '\nconst NFT_ABI');
-  const fakeFetch = fetchImpl ?? (async () => ({ ok: true, json: async () => validManifest() }));
+  const fakeFetch = fetchImpl ?? (async () => new Response(JSON.stringify(validManifest()), { status: 200 }));
   const validator = validateManifest ?? makeBackupValidator(source);
+  const readFn = extractBetween(source, 'async function readJsonResponseWithLimit(response, maxBytes) {', '\nasync function loadPreviousManifest');
+  const readJsonResponseWithLimit = new Function('Buffer', `return (${readFn});`)(Buffer);
   return new Function(
-    'validateArweaveId', 'getValidatedManifestUrl', 'fetch', 'AbortSignal', 'console', 'errorMessage', 'validateManifest',
+    'validateArweaveId', 'getValidatedManifestUrl', 'fetch', 'AbortSignal', 'console', 'errorMessage', 'validateManifest', 'readJsonResponseWithLimit', 'MAX_MANIFEST_BYTES',
     `return (${fn});`
   )(
     id => typeof id === 'string' && /^[A-Za-z0-9_-]{43}$/.test(id),
@@ -89,6 +91,8 @@ export function makePreviousManifestLoader({ source = backupSource, fetchImpl, v
     { timeout: () => undefined },
     { warn: (...args) => warnings.push(args) },
     error => error instanceof Error ? error.message : String(error),
-    validator
+    validator,
+    readJsonResponseWithLimit,
+    10 * 1024 * 1024
   );
 }

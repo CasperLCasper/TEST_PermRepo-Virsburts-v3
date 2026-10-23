@@ -133,19 +133,32 @@ test('B07 — iepriekšējais manifests tiek pilnībā validēts pirms atgrieša
 test('B07a — iepriekšējais manifests ar nederīgu struktūru netiek izmantots', async () => {
   const warnings = [];
   const loader = makePreviousManifestLoader({
-    fetchImpl: async () => ({ ok: true, json: async () => ({ ...validManifest(), paths: {} }) }),
+    fetchImpl: async () => new Response(JSON.stringify({ ...validManifest(), paths: {} }), { status: 200 }),
     warnings
   });
-  assert.equal(await loader(`ar://${'A'.repeat(43)}`), null);
+  await assert.rejects(loader(`ar://${'A'.repeat(43)}`), /backup ir apturēts/);
   assert.ok(warnings.length > 0);
 });
 
-test('B07b — nederīgs ID, ne-ar:// vērtība, HTTP kļūda un JSON kļūda droši atgriež null', async () => {
+test('B07b — tikai tukšs manifests nozīmē pirmo backup; bojāta URI/HTTP/JSON kļūda aptur backup', async () => {
   const defaultLoader = makePreviousManifestLoader();
-  assert.equal(await defaultLoader('https://not-an-arweave-uri'), null);
-  assert.equal(await defaultLoader('ar://bad'), null);
+  assert.equal(await defaultLoader(''), null);
+  await assert.rejects(defaultLoader('https://not-an-arweave-uri'), /URI nav derīgs/);
+  await assert.rejects(defaultLoader('ar://bad'), /ID nav derīgs/);
   const httpLoader = makePreviousManifestLoader({ fetchImpl: async () => ({ ok: false, status: 503 }) });
-  assert.equal(await httpLoader(`ar://${'A'.repeat(43)}`), null);
-  const jsonLoader = makePreviousManifestLoader({ fetchImpl: async () => ({ ok: true, json: async () => { throw new Error('bad JSON'); } }) });
-  assert.equal(await jsonLoader(`ar://${'A'.repeat(43)}`), null);
+  await assert.rejects(httpLoader(`ar://${'A'.repeat(43)}`), /backup ir apturēts/);
+  const jsonLoader = makePreviousManifestLoader({ fetchImpl: async () => new Response('{bad JSON', { status: 200 }) });
+  await assert.rejects(jsonLoader(`ar://${'A'.repeat(43)}`), /backup ir apturēts/);
+});
+
+test('B07c — iepriekšējā manifesta fetch aizliedz HTTP pāradresācijas', async () => {
+  let options;
+  const loader = makePreviousManifestLoader({
+    fetchImpl: async (_url, suppliedOptions) => {
+      options = suppliedOptions;
+      return new Response(JSON.stringify(validManifest()), { status: 200 });
+    }
+  });
+  await loader(`ar://${'A'.repeat(43)}`);
+  assert.equal(options.redirect, 'error');
 });

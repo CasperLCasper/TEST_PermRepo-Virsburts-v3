@@ -160,3 +160,17 @@ test('P15 — ANS-104 pārbaude izmanto AR.IO offsets endpoint, ja atbildē trū
   assert.match(verifier, /item\.id !== manifestId/);
   assert.match(verifier, /item\.rawData\)\.equals\(manifestBytes\)/);
 });
+
+test('P16 — ja offsets indekss nedod atrašanās vietu, tiek mēģināts HEAD /raw bez autentiskuma apiešanas', () => {
+  const source = read('server.js');
+  const start = source.indexOf('async function verifyArweaveDataItem(');
+  const end = source.indexOf('\nasync function loadPreviousManifest', start);
+  assert.ok(start >= 0 && end > start, 'Nav atrasta ANS-104 autentiskuma pārbaude.');
+  const verifier = source.slice(start, end);
+  assert.match(verifier, /method: 'HEAD'/);
+  assert.match(verifier, /\/raw\/\$\{encodeURIComponent\(manifestId\)\}/);
+  assert.match(verifier, /x-ar-io-root-data-item-offset/);
+  assert.match(verifier, /x-ar-io-data-item-size/);
+  assert.match(verifier, /DataItem\.verify\(rawItem\)/);
+  assert.match(verifier, /await item\.isValid\(\)/);
+});

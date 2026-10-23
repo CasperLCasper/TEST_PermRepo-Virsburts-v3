@@ -544,16 +544,9 @@ async function loadPreviousManifest(lastManifest) {
             return null;
         }
 
-        // ✅ B07 LABOJUMS: Validē iepriekšējo manifestu pirms tā izmantošanas
-        try {
-            validateManifest(manifest);
-        } catch (validationError) {
-            console.warn(
-                'Iepriekšējais manifests nav derīgs:',
-                errorMessage(validationError)
-            );
-            return null;
-        }
+        // B07: nekad neizmanto iepriekšējo manifestu inkrementālajam backup,
+        // pirms nav pārbaudīta visa tā struktūra un šifrēšanas metadati.
+        validateManifest(manifest);
 
         return manifest;
     } catch (error) {
@@ -2598,15 +2591,22 @@ app.post('/api/save-manifest-tx', backupLimiter, async (req, res) => {
                 walletAddress: wallet
             });
 
-            if (!job.zipTxId) {
-                throw new Error('ZIP transakcija vēl nav saglabāta.');
+            // B06: piesaista manifestu tieši GitHub repozitorijam,
+            // kuram šis backup job tika izveidots.
+            const manifestRepositoryId = String(manifest.metadata.repositoryId);
+            const jobRepositoryId = String(job.githubRepositoryId ?? '');
+
+            if (
+                !/^\d+$/.test(jobRepositoryId) ||
+                BigInt(manifestRepositoryId) !== BigInt(jobRepositoryId)
+            ) {
+                throw new Error(
+                    'Manifesta repositoryId nesakrīt ar job.githubRepositoryId.'
+                );
             }
 
-            // ✅ B06 LABOJUMS: Pārbauda, vai manifesta repositoryId atbilst job repositoryId
-            if (String(manifest.metadata?.repositoryId) !== String(job.githubRepositoryId)) {
-                throw new Error(
-                    'Manifesta repositoryId nesakrīt ar backup job repositoryId.'
-                );
+            if (!job.zipTxId) {
+                throw new Error('ZIP transakcija vēl nav saglabāta.');
             }
 
             // ✅ Idempotence

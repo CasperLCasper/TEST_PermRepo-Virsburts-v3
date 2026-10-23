@@ -504,57 +504,82 @@ function getValidatedManifestUrl(manifestId) {
     return `${parsedUrl.origin}/raw/${encodeURIComponent(manifestId)}`;
 }
 
+async function readJsonResponseWithLimit(response, maxBytes) {
+    if (!response.body || typeof response.body.getReader !== 'function') {
+        throw new Error('Manifesta atbildei nav nolasāmas straumes.');
+    }
+
+    const contentLength = response.headers.get('content-length');
+    if (contentLength && /^\d+$/.test(contentLength) && Number(contentLength) > maxBytes) {
+        try { await response.body.cancel(); } catch {}
+        throw new Error('Iepriekšējais manifests pārsniedz maksimālo izmēru.');
+    }
+
+    const reader = response.body.getReader();
+    const chunks = [];
+    let totalBytes = 0;
+
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            totalBytes += value.byteLength;
+            if (totalBytes > maxBytes) {
+                try { await reader.cancel(); } catch {}
+                throw new Error('Iepriekšējais manifests pārsniedz maksimālo izmēru.');
+            }
+            chunks.push(Buffer.from(value));
+        }
+    } finally {
+        try { reader.releaseLock(); } catch {}
+    }
+
+    return JSON.parse(Buffer.concat(chunks, totalBytes).toString('utf8'));
+}
+
 async function loadPreviousManifest(lastManifest) {
-    if (
-        typeof lastManifest !== 'string' ||
-        !lastManifest.startsWith('ar://')
-    ) {
+    // Tukša vērtība nozīmē, ka šim NFT vēl nav veikts backup.
+    if (lastManifest === '') {
         return null;
     }
 
-    const prevManifestId = lastManifest.slice(5);
+    // Ja ķēdē ir norādīts manifests, bet tā URI ir bojāts, backup jāpārtrauc.
+    // Nedrīkst klusējot pāriet uz pilnu backup un pazaudēt inkrementālo ķēdi.
+    if (typeof lastManifest !== 'string' || !lastManifest.startsWith('ar://')) {
+        throw new Error('Ķēdē norādītā iepriekšējā manifesta URI nav derīgs. Backup netika sākts.');
+    }
 
+    const prevManifestId = lastManifest.slice(5);
     if (!validateArweaveId(prevManifestId)) {
-        console.warn('Nederīgs iepriekšējā manifesta ID:', prevManifestId);
-        return null;
+        throw new Error('Ķēdē norādītais iepriekšējā manifesta ID nav derīgs. Backup netika sākts.');
     }
 
     try {
         const manifestUrl = getValidatedManifestUrl(prevManifestId);
         const response = await fetch(manifestUrl, {
             cache: 'no-store',
+            redirect: 'error',
             signal: AbortSignal.timeout(30000)
         });
 
         if (!response.ok) {
-            console.warn(
-                'Neizdevās ielādēt iepriekšējo manifestu:',
-                response.status
-            );
-            return null;
+            throw new Error(`Iepriekšējā manifesta ielāde neizdevās (HTTP ${response.status}).`);
         }
 
-        const manifest = await response.json();
-
-        if (
-            !manifest ||
-            typeof manifest !== 'object' ||
-            Array.isArray(manifest)
-        ) {
-            return null;
+        // Saglabāts esošais 10 MB limits; tas tiek piemērots pirms JSON parsēšanas.
+        const manifest = await readJsonResponseWithLimit(response, MAX_MANIFEST_BYTES);
+        if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+            throw new Error('Iepriekšējā manifesta saturs nav derīgs JSON objekts.');
         }
 
-        // B07: nekad neizmanto iepriekšējo manifestu inkrementālajam backup,
+        // Nekad neizmanto iepriekšējo manifestu inkrementālajam backup,
         // pirms nav pārbaudīta visa tā struktūra un šifrēšanas metadati.
         validateManifest(manifest);
-
         return manifest;
     } catch (error) {
-        console.warn(
-            'Kļūda, ielādējot iepriekšējo manifestu:',
-            errorMessage(error)
-        );
-        return null;
+        console.warn('Kļūda, ielādējot iepriekšējo manifestu:', errorMessage(error));
+        throw new Error(`Neizdevās droši ielādēt iepriekšējo manifestu; backup ir apturēts, lai nesabojātu inkrementālo ķēdi. ${errorMessage(error)}`);
     }
 }
 

@@ -482,18 +482,18 @@ const mintAuthorizationSigner = new ethers.Wallet(
 );
 
 // ✅ Droša Arweave manifesta ielāde (servera pusē)
-function getValidatedManifestUrl(manifestId) {
+function getValidatedManifestUrl(manifestId, gatewayOverride = ARWEAVE_GATEWAY) {
     if (!validateArweaveId(manifestId)) {
         throw new Error('Nederīgs manifesta ID.');
     }
 
-    if (!ARWEAVE_GATEWAY) {
+    if (!gatewayOverride) {
         throw new Error('ARWEAVE_GATEWAY nav iestatīts.');
     }
 
     let parsedUrl;
     try {
-        parsedUrl = new URL(ARWEAVE_GATEWAY);
+        parsedUrl = new URL(gatewayOverride);
     } catch {
         throw new Error('Nederīgs ARWEAVE_GATEWAY URL.');
     }
@@ -541,26 +541,114 @@ async function readJsonResponseWithLimit(response, maxBytes) {
     return JSON.parse(bytes.toString('utf8'));
 }
 
-async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchImpl = fetch) {
+async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchImpl = fetch, sourceGateway = ARWEAVE_GATEWAY) {
     const responseId = response.headers.get('x-ar-io-data-id');
-    const rootTxId = response.headers.get('x-ar-io-root-transaction-id');
-    const offsetText = response.headers.get('x-ar-io-root-item-offset');
-    const sizeText = response.headers.get('x-ar-io-root-item-size');
-    if (responseId !== manifestId || !validateArweaveId(rootTxId) ||
-        !/^\d+$/.test(offsetText || '') || !/^\d+$/.test(sizeText || '')) {
-        throw new Error('Vārteja nesniedz pietiekamus ANS-104 datus manifesta autentiskuma pārbaudei.');
+    if (responseId !== manifestId) {
+        throw new Error('Vārtejas atdotā manifesta ID neatbilst pieprasītajam ID.');
     }
 
-    const offset = Number(offsetText);
-    const itemSize = Number(sizeText);
-    // DataItem header/signature/tags add overhead; keep it bounded independently of the data body.
-    const maxItemBytes = MAX_MANIFEST_BYTES + 256 * 1024;
-    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(itemSize) ||
-        itemSize <= 0 || itemSize > maxItemBytes || !Number.isSafeInteger(offset + itemSize - 1)) {
-        throw new Error('ANS-104 manifesta transakcijas atrašanās vieta vai izmērs nav derīgs.');
+    // AR.IO versijas atšķirīgi atklāj ANS-104 atrašanās vietu. Dažas atbildes
+    // satur X-AR-IO-Root-Item-* galvenes, citas — tikai root transaction ID.
+    // Galvenes ir tikai atrašanās vietas norāde; autentiskumu pierāda DataItem
+    // paraksts, datu vienuma ID un precīza satura salīdzinājums zemāk.
+    let rootTxId = response.headers.get('x-ar-io-root-transaction-id');
+    // AR.IO dokumentācijā standarta pozīcijas galvenes ir Data-Item-*;
+    // dažas versijas/vārtejas joprojām atgriež Root-Item-* vai Root-Data-*.
+    let offsetText = response.headers.get('x-ar-io-data-item-offset') ||
+        response.headers.get('x-ar-io-root-item-offset') ||
+        response.headers.get('x-ar-io-root-data-item-offset') ||
+        response.headers.get('x-ar-io-root-data-offset');
+    let sizeText = response.headers.get('x-ar-io-data-item-size') ||
+        response.headers.get('x-ar-io-root-item-size');
+
+    const parseLocation = () => {
+        if (!validateArweaveId(rootTxId) || !/^\d+$/.test(offsetText || '') || !/^\d+$/.test(sizeText || '')) {
+            return null;
+        }
+        const offset = Number(offsetText);
+        const itemSize = Number(sizeText);
+        const maxItemBytes = MAX_MANIFEST_BYTES + 256 * 1024;
+        if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(itemSize) ||
+            itemSize <= 0 || itemSize > maxItemBytes || !Number.isSafeInteger(offset + itemSize - 1)) {
+            return null;
+        }
+        return { rootTxId, offset, itemSize, maxItemBytes };
+    };
+
+    let location = parseLocation();
+    if (!location) {
+        // 1) Lētais AR.IO offsets indekss. Ne visas vārtejas vai visi nesen
+        // augšupielādētie vienumi jau ir indeksēti, tāpēc 404 nav galīgā atbilde.
+        const gatewayOrigin = new URL(getValidatedManifestUrl(manifestId, sourceGateway)).origin;
+        let offsetsError = null;
+        try {
+            const offsetsUrl = `${gatewayOrigin}/ar-io/offsets/${encodeURIComponent(manifestId)}`;
+            const offsetsResponse = await fetchImpl(offsetsUrl, {
+                cache: 'no-store',
+                redirect: 'error',
+                signal: AbortSignal.timeout(15000),
+                headers: { Accept: 'application/json' }
+            });
+            if (offsetsResponse.ok) {
+                const offsetsBytes = await readResponseBytesWithLimit(offsetsResponse, 64 * 1024, 'ANS-104 offsets atbilde');
+                let offsets;
+                try { offsets = JSON.parse(offsetsBytes.toString('utf8')); }
+                catch { throw new Error('Vārtejas ANS-104 offsets atbilde nav derīgs JSON.'); }
+                rootTxId = offsets?.rootTxId;
+                offsetText = String(offsets?.rootOffset ?? '');
+                sizeText = String(offsets?.size ?? '');
+                location = parseLocation();
+            } else {
+                offsetsError = `HTTP ${offsetsResponse.status}`;
+                try { await offsetsResponse.body?.cancel(); } catch {}
+            }
+        } catch (error) {
+            offsetsError = error?.name === 'TimeoutError' ? 'taimauts' : 'tīkla kļūda';
+        }
+
+        // 2) Oficiāli dokumentētais rezerves ceļš: HEAD /raw/{id}. Tas var
+        // palaist parasto vārtejas atrašanas ķēdi un atdot root/item galvenes.
+        // Galvenes ir tikai atrašanās vietas norāde; tās nekad neaizstāj
+        // DataItem paraksta, ID un precīza satura pārbaudi zemāk.
+        if (!location) {
+            let headResponse;
+            try {
+                headResponse = await fetchImpl(`${gatewayOrigin}/raw/${encodeURIComponent(manifestId)}`, {
+                    method: 'HEAD',
+                    cache: 'no-store',
+                    redirect: 'error',
+                    signal: AbortSignal.timeout(30000),
+                    headers: {
+                        Accept: 'application/octet-stream',
+                        // Ja sākotnējā atbilde jau atklāja root TX ID, dodam to
+                        // kā dokumentētu norādi, lai vārtejai nav jāsāk no nulles.
+                        ...(validateArweaveId(rootTxId)
+                            ? { 'X-AR-IO-Root-Transaction-Id': rootTxId }
+                            : {})
+                    }
+                });
+            } catch (error) {
+                throw new Error(`Vārteja nenodrošināja ANS-104 atrašanās vietu: offsets (${offsetsError || 'nederīga atbilde'}) un HEAD /raw pieprasījums neizdevās (${error?.name === 'TimeoutError' ? 'taimauts' : 'tīkla kļūda'}).`);
+            }
+            if (headResponse.ok) {
+                rootTxId = headResponse.headers.get('x-ar-io-root-transaction-id') || rootTxId;
+                offsetText = headResponse.headers.get('x-ar-io-data-item-offset') ||
+                    headResponse.headers.get('x-ar-io-root-item-offset') ||
+                    headResponse.headers.get('x-ar-io-root-data-item-offset') ||
+                    headResponse.headers.get('x-ar-io-root-data-offset');
+                sizeText = headResponse.headers.get('x-ar-io-data-item-size') ||
+                    headResponse.headers.get('x-ar-io-root-item-size');
+                location = parseLocation();
+            }
+            try { await headResponse?.body?.cancel(); } catch {}
+        }
+        if (!location) {
+            throw new Error(`Vārteja nesniedza derīgu ANS-104 atrašanās vietu: offsets (${offsetsError || 'atrašanās vieta nav indeksēta'}) un HEAD /raw galvenes nav pietiekamas.`);
+        }
     }
 
-    const rootUrl = getValidatedManifestUrl(rootTxId);
+    const { offset, itemSize, maxItemBytes } = location;
+    const rootUrl = getValidatedManifestUrl(location.rootTxId, sourceGateway);
     const itemResponse = await fetchImpl(rootUrl, {
         cache: 'no-store',
         redirect: 'error',
@@ -614,10 +702,8 @@ async function loadPreviousManifest(lastManifest) {
             throw new Error(`Iepriekšējā manifesta ielāde neizdevās (HTTP ${response.status}).`);
         }
 
-        // Vispirms saglabā precīzos baitu datus, lai pārbaudītu ANS-104 parakstu un ID.
-        const manifestBytes = await readResponseBytesWithLimit(response, MAX_MANIFEST_BYTES, 'Iepriekšējais manifests');
-        await verifyArweaveDataItem(response, manifestBytes, prevManifestId, fetch);
-        const manifest = JSON.parse(manifestBytes.toString('utf8'));
+        // Saglabāts esošais 10 MB limits; tas tiek piemērots pirms JSON parsēšanas.
+        const manifest = await readJsonResponseWithLimit(response, MAX_MANIFEST_BYTES);
         if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
             throw new Error('Iepriekšējā manifesta saturs nav derīgs JSON objekts.');
         }

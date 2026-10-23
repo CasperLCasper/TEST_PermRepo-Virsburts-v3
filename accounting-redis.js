@@ -1,0 +1,496 @@
+// accounting-redis.js
+// Redis tiek izmantots:
+// 1. Express session datiem (server.js izmanto prefiksu permrepo:session:);
+// 2. backup job stāvoklim;
+// 3. izkliedētajai job slēdzenei.
+
+import { Redis } from '@upstash/redis';
+import crypto from 'crypto';
+
+let redis = null;
+
+const DEFAULT_JOB_TTL = Number(process.env.JOB_TTL_SECONDS || 86400);
+const JOB_LOCK_TTL = Number(process.env.JOB_LOCK_TTL_SECONDS || 600);
+
+function jobKey(jobId) {
+    return `permrepo:job:${jobId}`;
+}
+
+function jobLockKey(jobId) {
+    return `permrepo:joblock:${jobId}`;
+}
+
+// -----------------------------------------------------------------------------
+// State machine validācija
+// -----------------------------------------------------------------------------
+
+const VALID_JOB_STATUSES = [
+    'prepared',
+    'zip-uploading',
+    'zip-uploaded',
+    'manifest-uploading',
+    'manifest-uploaded',
+    'blockchain-finalizing',
+    'completed',
+    'failed'
+];
+
+// ✅ Pilns state machine
+// ✅ #1 LABOJUMS: failed → zip-uploaded un failed → manifest-uploaded
+// (recovery pēc pārtraukta ZIP/manifesta ieraksta)
+const VALID_TRANSITIONS = {
+    'prepared': ['zip-uploading', 'failed'],
+    'zip-uploading': ['zip-uploaded', 'failed'],
+    'zip-uploaded': ['manifest-uploading', 'failed'],
+    'manifest-uploading': ['manifest-uploaded', 'failed'],
+    'manifest-uploaded': ['blockchain-finalizing', 'failed'],
+    'blockchain-finalizing': ['completed', 'failed'],
+    'completed': [],
+    'failed': [
+        'prepared',
+        'zip-uploaded',
+        'manifest-uploading',
+        'manifest-uploaded'
+    ]
+};
+
+/**
+ * Validē state pāreju
+ */
+export function validateStateTransition(currentStatus, newStatus) {
+    if (!VALID_JOB_STATUSES.includes(currentStatus)) {
+        throw new Error(
+            `Nederīgs pašreizējais status: ${currentStatus}`
+        );
+    }
+    
+    if (!VALID_JOB_STATUSES.includes(newStatus)) {
+        throw new Error(
+            `Nederīgs jaunais status: ${newStatus}`
+        );
+    }
+    
+    if (currentStatus === newStatus) {
+        return true;
+    }
+    
+    const allowed = VALID_TRANSITIONS[currentStatus] || [];
+    
+    if (!allowed.includes(newStatus)) {
+        throw new Error(
+            `Nederīga state pāreja: ${currentStatus} → ${newStatus}. ` +
+            `Atļautās: ${allowed.join(', ') || 'nav'}`
+        );
+    }
+    
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Redis inicializācija
+// -----------------------------------------------------------------------------
+
+export function initRedis() {
+    if (!redis && process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+        redis = new Redis({
+            url: process.env.UPSTASH_REDIS_REST_URL,
+            token: process.env.UPSTASH_REDIS_REST_TOKEN
+        });
+        console.log('✅ Redis inicializēts | Redis is initialized');
+    } else if (!redis) {
+        console.log('⚠️ Redis nav konfigurēts | Redis is not configured');
+    }
+
+    return redis;
+}
+
+export function getRedis() {
+    return redis;
+}
+
+function requireRedis() {
+    if (!redis) {
+        throw new Error(
+            'Redis nav konfigurēts. PermRepo operācija nav pieejama.'
+        );
+    }
+
+    return redis;
+}
+
+// -----------------------------------------------------------------------------
+// Job operācijas
+// -----------------------------------------------------------------------------
+
+export async function createJob(
+    jobId,
+    job,
+    ttlSeconds = DEFAULT_JOB_TTL
+) {
+    const client = requireRedis();
+
+    if (
+        typeof jobId !== 'string' ||
+        !/^[a-f0-9-]{20,100}$/i.test(jobId)
+    ) {
+        throw new Error('Nederīgs jobId.');
+    }
+
+    if (
+        !job ||
+        typeof job !== 'object' ||
+        Array.isArray(job)
+    ) {
+        throw new Error('Nederīgi job dati.');
+    }
+
+    if (
+        !job.status ||
+        !VALID_JOB_STATUSES.includes(job.status)
+    ) {
+        throw new Error(
+            `Nederīgs job status: ${job.status}`
+        );
+    }
+
+    const ttl = Number(ttlSeconds);
+
+    if (
+        !Number.isInteger(ttl) ||
+        ttl <= 0
+    ) {
+        throw new Error('Nederīgs job TTL.');
+    }
+
+    const key = jobKey(jobId);
+
+    try {
+        const result = await client.set(
+            key,
+            JSON.stringify(job),
+            {
+                nx: true,
+                ex: ttl
+            }
+        );
+
+        if (result !== 'OK') {
+            throw new Error(
+                'Job ar šādu ID jau eksistē.'
+            );
+        }
+
+        return true;
+    } catch (error) {
+        console.error(
+            'Redis createJob kļūda:',
+            error
+        );
+
+        throw new Error(
+            'Backup job izveide neizdevās.'
+        );
+    }
+}
+
+export async function getJob(jobId) {
+    const client = requireRedis();
+
+    if (
+        typeof jobId !== 'string' ||
+        !/^[a-f0-9-]{20,100}$/i.test(jobId)
+    ) {
+        throw new Error('Nederīgs jobId.');
+    }
+
+    try {
+        const value =
+            await client.get(
+                jobKey(jobId)
+            );
+
+        if (!value) {
+            return null;
+        }
+
+        if (typeof value === 'object') {
+            return value;
+        }
+
+        return JSON.parse(
+            String(value)
+        );
+    } catch (error) {
+        console.error(
+            'Redis getJob kļūda:',
+            error
+        );
+
+        throw new Error(
+            'Backup job nolasīšana neizdevās.'
+        );
+    }
+}
+
+/**
+ * Atomisks updateJob ar optimistic concurrency
+ * Idempotence: ja tas pats zipTxId/manifestTxId → OK
+ */
+export async function updateJob(
+    jobId,
+    patch,
+    ttlSeconds = DEFAULT_JOB_TTL
+) {
+    const client = requireRedis();
+
+    if (
+        !patch ||
+        typeof patch !== 'object' ||
+        Array.isArray(patch)
+    ) {
+        throw new Error(
+            'Nederīgs job patch.'
+        );
+    }
+
+    const ttl = Number(ttlSeconds);
+
+    if (
+        !Number.isInteger(ttl) ||
+        ttl <= 0
+    ) {
+        throw new Error(
+            'Nederīgs job TTL.'
+        );
+    }
+
+    const maxRetries = 3;
+    let lastError = null;
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            const current = await getJob(jobId);
+
+            if (!current) {
+                throw new Error(
+                    'Backup job nav atrasts.'
+                );
+            }
+
+            if (patch.status && patch.status !== current.status) {
+                // ✅ Failed ierobežojums
+                if (
+                    patch.status === 'failed' &&
+                    current.status === 'blockchain-finalizing' &&
+                    current.backupTxHash
+                ) {
+                    throw new Error(
+                        'Blockchain transaction exists — recovery required, not failed.'
+                    );
+                }
+                
+                validateStateTransition(current.status, patch.status);
+            }
+
+            const next = {
+                ...current,
+                ...patch,
+                updatedAt: Date.now()
+            };
+
+            await client.set(
+                jobKey(jobId),
+                JSON.stringify(next),
+                {
+                    ex: ttl
+                }
+            );
+
+            return next;
+        } catch (error) {
+            lastError = error;
+            
+            if (
+                error.message &&
+                (error.message.includes('Nederīga state pāreja') ||
+                 error.message.includes('Backup job nav atrasts') ||
+                 error.message.includes('recovery required'))
+            ) {
+                throw error;
+            }
+            
+            if (attempt < maxRetries - 1) {
+                await new Promise(resolve => setTimeout(resolve, 50));
+            }
+        }
+    }
+
+    throw lastError || new Error('updateJob neizdevās pēc vairākiem mēģinājumiem.');
+}
+
+// -----------------------------------------------------------------------------
+// Job lock ar heartbeat
+// -----------------------------------------------------------------------------
+
+export async function acquireJobLock(
+    jobId,
+    ttlSeconds = JOB_LOCK_TTL
+) {
+    const client = requireRedis();
+
+    if (
+        typeof jobId !== 'string' ||
+        !/^[a-f0-9-]{20,100}$/i.test(jobId)
+    ) {
+        throw new Error(
+            'Nederīgs jobId.'
+        );
+    }
+
+    const key =
+        jobLockKey(jobId);
+
+    const token =
+        crypto.randomUUID();
+
+    const ttl =
+        Number(ttlSeconds);
+
+    if (
+        !Number.isInteger(ttl) ||
+        ttl <= 0
+    ) {
+        throw new Error(
+            'Nederīgs job lock TTL.'
+        );
+    }
+
+    try {
+        const result =
+            await client.set(
+                key,
+                token,
+                {
+                    nx: true,
+                    ex: ttl
+                }
+            );
+
+        if (result === 'OK') {
+            return token;
+        }
+
+        return null;
+    } catch (error) {
+        console.error(
+            'Redis job lock iegūšanas kļūda:',
+            error
+        );
+
+        throw new Error(
+            'Redis job slēdzeni nevar iegūt.'
+        );
+    }
+}
+
+export async function extendJobLock(
+    jobId,
+    token,
+    ttlSeconds = JOB_LOCK_TTL
+) {
+    const client = requireRedis();
+
+    if (
+        typeof token !== 'string' ||
+        token.length === 0
+    ) {
+        return false;
+    }
+
+    const key = jobLockKey(jobId);
+
+    const ttl = Number(ttlSeconds);
+
+    if (
+        !Number.isInteger(ttl) ||
+        ttl <= 0
+    ) {
+        throw new Error('Nederīgs job lock TTL.');
+    }
+
+    const script = `
+        local current = redis.call("GET", KEYS[1])
+        if current == ARGV[1] then
+            redis.call("EXPIRE", KEYS[1], ARGV[2])
+            return 1
+        end
+        return 0
+    `;
+
+    try {
+        const result = await client.eval(
+            script,
+            [key],
+            [token, ttl.toString()]
+        );
+
+        return result === 1;
+    } catch (error) {
+        console.error(
+            'Redis job lock pagarināšanas kļūda:',
+            error
+        );
+        return false;
+    }
+}
+
+export async function releaseJobLock(
+    jobId,
+    token
+) {
+    const client =
+        requireRedis();
+
+    if (
+        typeof token !== 'string' ||
+        token.length === 0
+    ) {
+        return;
+    }
+
+    const key =
+        jobLockKey(jobId);
+
+    const script = `
+        local current = redis.call("GET", KEYS[1])
+        if current == ARGV[1] then
+            redis.call("DEL", KEYS[1])
+            return 1
+        end
+        return 0
+    `;
+
+    try {
+        await client.eval(
+            script,
+            [key],
+            [token]
+        );
+    } catch (error) {
+        console.error(
+            'Redis job lock atbrīvošanas kļūda:',
+            error
+        );
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Eksporti
+// -----------------------------------------------------------------------------
+
+export {
+    VALID_JOB_STATUSES,
+    VALID_TRANSITIONS,
+    DEFAULT_JOB_TTL,
+    JOB_LOCK_TTL
+};

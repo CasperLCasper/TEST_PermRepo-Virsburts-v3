@@ -103,3 +103,26 @@ test('P10 — accounting-redis saglabā atļautās backup state pārejas un aizl
   assert.match(html, /id=["']root["']/);
   assert.match(html, /src=["']\/src\/main\.jsx["']/);
 });
+
+
+test('P12 — iepriekšējā manifesta atbilde tiek ierobežota pirms JSON parsēšanas', () => {
+  const source = read('server.js');
+  assert.match(source, /async function readJsonResponseWithLimit\(response, maxBytes\)/);
+  assert.match(source, /totalBytes \+= value\.byteLength/);
+  assert.match(source, /totalBytes > maxBytes/);
+  assert.match(source, /readJsonResponseWithLimit\(response, MAX_MANIFEST_BYTES\)/);
+  assert.doesNotMatch(source, /const manifest = await response\.json\(\)/);
+});
+
+test('P13 — limita funkcija noraida pārāk lielu manifesta atbildi pirms parsēšanas', async () => {
+  const source = read('server.js');
+  const start = source.indexOf('async function readJsonResponseWithLimit(response, maxBytes) {');
+  const end = source.indexOf('\nasync function loadPreviousManifest', start);
+  assert.ok(start >= 0 && end > start, 'Nav atrasta manifesta izmēra limita funkcija.');
+  const readLimited = new Function('Buffer', `return (${source.slice(start, end)});`)(Buffer);
+  await assert.rejects(
+    readLimited(new Response(JSON.stringify({ payload: 'x'.repeat(100) })), 20),
+    /pārsniedz maksimālo izmēru/
+  );
+  assert.deepEqual(await readLimited(new Response('{"ok":true}'), 20), { ok: true });
+});

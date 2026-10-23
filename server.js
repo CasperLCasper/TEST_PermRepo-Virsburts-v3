@@ -14,6 +14,7 @@ import session from 'express-session';
 import rateLimit from 'express-rate-limit';
 import { ethers } from 'ethers';
 import yauzl from 'yauzl';
+import { DataItem } from '@dha-team/arbundles';
 
 import {
     initRedis,
@@ -504,38 +505,84 @@ function getValidatedManifestUrl(manifestId) {
     return `${parsedUrl.origin}/raw/${encodeURIComponent(manifestId)}`;
 }
 
-async function readJsonResponseWithLimit(response, maxBytes) {
+async function readResponseBytesWithLimit(response, maxBytes, label = 'Manifests') {
     if (!response.body || typeof response.body.getReader !== 'function') {
-        throw new Error('Manifesta atbildei nav nolasāmas straumes.');
+        throw new Error(`${label} atbildei nav nolasāmas straumes.`);
     }
 
     const contentLength = response.headers.get('content-length');
     if (contentLength && /^\d+$/.test(contentLength) && Number(contentLength) > maxBytes) {
         try { await response.body.cancel(); } catch {}
-        throw new Error('Iepriekšējais manifests pārsniedz maksimālo izmēru.');
+        throw new Error(`${label} pārsniedz maksimālo izmēru.`);
     }
 
     const reader = response.body.getReader();
     const chunks = [];
     let totalBytes = 0;
-
     try {
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-
             totalBytes += value.byteLength;
             if (totalBytes > maxBytes) {
                 try { await reader.cancel(); } catch {}
-                throw new Error('Iepriekšējais manifests pārsniedz maksimālo izmēru.');
+                throw new Error(`${label} pārsniedz maksimālo izmēru.`);
             }
             chunks.push(Buffer.from(value));
         }
     } finally {
         try { reader.releaseLock(); } catch {}
     }
+    return Buffer.concat(chunks, totalBytes);
+}
 
-    return JSON.parse(Buffer.concat(chunks, totalBytes).toString('utf8'));
+async function readJsonResponseWithLimit(response, maxBytes) {
+    const bytes = await readResponseBytesWithLimit(response, maxBytes, 'Iepriekšējais manifests');
+    return JSON.parse(bytes.toString('utf8'));
+}
+
+async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchImpl = fetch) {
+    const responseId = response.headers.get('x-ar-io-data-id');
+    const rootTxId = response.headers.get('x-ar-io-root-transaction-id');
+    const offsetText = response.headers.get('x-ar-io-root-item-offset');
+    const sizeText = response.headers.get('x-ar-io-root-item-size');
+    if (responseId !== manifestId || !validateArweaveId(rootTxId) ||
+        !/^\d+$/.test(offsetText || '') || !/^\d+$/.test(sizeText || '')) {
+        throw new Error('Vārteja nesniedz pietiekamus ANS-104 datus manifesta autentiskuma pārbaudei.');
+    }
+
+    const offset = Number(offsetText);
+    const itemSize = Number(sizeText);
+    // DataItem header/signature/tags add overhead; keep it bounded independently of the data body.
+    const maxItemBytes = MAX_MANIFEST_BYTES + 256 * 1024;
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(itemSize) ||
+        itemSize <= 0 || itemSize > maxItemBytes || !Number.isSafeInteger(offset + itemSize - 1)) {
+        throw new Error('ANS-104 manifesta transakcijas atrašanās vieta vai izmērs nav derīgs.');
+    }
+
+    const rootUrl = getValidatedManifestUrl(rootTxId);
+    const itemResponse = await fetchImpl(rootUrl, {
+        cache: 'no-store',
+        redirect: 'error',
+        signal: AbortSignal.timeout(30000),
+        headers: { Range: `bytes=${offset}-${offset + itemSize - 1}` }
+    });
+    if (itemResponse.status !== 206) {
+        try { await itemResponse.body?.cancel(); } catch {}
+        throw new Error('Neizdevās iegūt ANS-104 datu vienumu kriptogrāfiskai pārbaudei.');
+    }
+    const rawItem = await readResponseBytesWithLimit(itemResponse, maxItemBytes, 'ANS-104 datu vienums');
+    if (rawItem.length !== itemSize || !(await DataItem.verify(rawItem))) {
+        throw new Error('Iepriekšējā manifesta ANS-104 struktūra nav derīga.');
+    }
+    const item = new DataItem(rawItem);
+    if (!(await item.isValid())) {
+        throw new Error('Iepriekšējā manifesta ANS-104 paraksts nav derīgs.');
+    }
+    if (item.id !== manifestId || !Buffer.from(item.rawData).equals(manifestBytes)) {
+        throw new Error('Iepriekšējā manifesta saturs neatbilst parakstītajam Arweave datu vienumam.');
+    }
+    return true;
 }
 
 async function loadPreviousManifest(lastManifest) {
@@ -567,8 +614,10 @@ async function loadPreviousManifest(lastManifest) {
             throw new Error(`Iepriekšējā manifesta ielāde neizdevās (HTTP ${response.status}).`);
         }
 
-        // Saglabāts esošais 10 MB limits; tas tiek piemērots pirms JSON parsēšanas.
-        const manifest = await readJsonResponseWithLimit(response, MAX_MANIFEST_BYTES);
+        // Vispirms saglabā precīzos baitu datus, lai pārbaudītu ANS-104 parakstu un ID.
+        const manifestBytes = await readResponseBytesWithLimit(response, MAX_MANIFEST_BYTES, 'Iepriekšējais manifests');
+        await verifyArweaveDataItem(response, manifestBytes, prevManifestId, fetch);
+        const manifest = JSON.parse(manifestBytes.toString('utf8'));
         if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
             throw new Error('Iepriekšējā manifesta saturs nav derīgs JSON objekts.');
         }

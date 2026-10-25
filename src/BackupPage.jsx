@@ -109,7 +109,7 @@ function BackupPage() {
     const [recoveredJobData, setRecoveredJobData] = useState(null);
 
     const masterKeyRef = useRef(null);
-    const uploadedZipRef = useRef({ txId: null, iv: null, merkleRoot: null });
+    const uploadedZipRef = useRef({ txId: null, iv: null, merkleRoot: null, archiveContains: null });
     const uploadedManifestRef = useRef({ txId: null, manifest: null });
     const submittedBackupTxHashRef = useRef(null);
     const previousManifestRef = useRef(null);
@@ -456,10 +456,31 @@ function BackupPage() {
                             // Redis ir darba stāvokļa reģistrs; lokālais žurnāls var saturēt
                             // ID, kuru Turbo jau atdeva, bet Redis ieraksts vēl nav izdevies.
                             if (recoveryJournal) {
+                                // Restore each missing checkpoint field independently. Redis may
+                                // know the ZIP ID while the local journal is the only surviving
+                                // copy of its IV, Merkle commitment, or crypto format version.
                                 if (!jobStatus.zipTxId && recoveryJournal.zipTxId) {
                                     jobStatus.zipTxId = recoveryJournal.zipTxId;
-                                    jobStatus.zipIv = recoveryJournal.zipIv || null;
-                                    jobStatus.zipMerkleRoot = recoveryJournal.zipMerkleRoot || null;
+                                }
+                                const hasValidZipIv = value => Array.isArray(value) && value.length === 12 &&
+                                    value.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255);
+                                if (!hasValidZipIv(jobStatus.zipIv) && hasValidZipIv(recoveryJournal.zipIv)) {
+                                    jobStatus.zipIv = recoveryJournal.zipIv;
+                                }
+                                if (!jobStatus.zipMerkleRoot && recoveryJournal.zipMerkleRoot) {
+                                    jobStatus.zipMerkleRoot = recoveryJournal.zipMerkleRoot;
+                                }
+                                if (!jobStatus.zipKeyVerifier && recoveryJournal.zipKeyVerifier) {
+                                    jobStatus.zipKeyVerifier = recoveryJournal.zipKeyVerifier;
+                                }
+                                if (!jobStatus.archiveContains && Array.isArray(recoveryJournal.internalArchiveContains)) {
+                                    const currentArchiveEntries = Array.isArray(jobStatus.changedFileMetadata)
+                                        ? jobStatus.changedFileMetadata.map(file => ({ path: file.path, hash: file.hash }))
+                                        : [];
+                                    jobStatus.archiveContains = [...currentArchiveEntries, ...recoveryJournal.internalArchiveContains];
+                                }
+                                if (jobStatus.cryptoVersion == null && recoveryJournal.cryptoVersion != null) {
+                                    jobStatus.cryptoVersion = recoveryJournal.cryptoVersion;
                                 }
                                 if (!jobStatus.manifestTxId && recoveryJournal.manifestTxId) {
                                     jobStatus.manifestTxId = recoveryJournal.manifestTxId;
@@ -492,6 +513,11 @@ function BackupPage() {
                                 jobStatus.status === 'blockchain-finalizing' &&
                                 jobStatus.backupTxHash
                             ) {
+                                // Keep server-side recovery data in UI state before the
+                                // automatic completion attempt, so a failed RPC/receipt
+                                // lookup does not hide the manual recovery action.
+                                setRecoveredJobData(jobStatus);
+                                setRecoveryRequired(true);
                                 setStatus(t('checking-blockchain-tx'));
                                 setFileInfo({ count: 0, sizeText: '', loading: false });
 
@@ -519,10 +545,37 @@ function BackupPage() {
                                     clearRecoveryJournal();
                                     return;
                                 } catch (recoveryError) {
-                                    setRecoveryRequired(true);
-                                    setStatus(t('recovery-required'));
-                                    setError(getSafeErrorMessage(recoveryError, t));
-                                    return;
+                                    let safelyRetryable = false;
+                                    try {
+                                        const failureRecovery = await apiJson('/api/fail-backup', {
+                                            method: 'POST',
+                                            headers: { 'Content-Type': 'application/json' },
+                                            body: JSON.stringify({
+                                                jobId: jobStatus.jobId,
+                                                txHash: jobStatus.backupTxHash,
+                                                error: getSafeErrorMessage(recoveryError, t)
+                                            })
+                                        });
+                                        safelyRetryable = failureRecovery?.status === 'manifest-uploaded' && failureRecovery?.retryable === true;
+                                    } catch {
+                                        // Pending, successful, or unknown transaction: keep recovery state.
+                                    }
+                                    if (safelyRetryable) {
+                                        jobStatus.status = 'manifest-uploaded';
+                                        jobStatus.backupTxHash = null;
+                                        jobStatus.retryableBlockchainFailure = true;
+                                        try {
+                                            localStorage.removeItem(`permrepo-backup-tx-${repoStorageKey}`);
+                                            updateRecoveryJournal({ stage: 'manifest-uploaded', backupTxHash: null });
+                                        } catch {}
+                                        setRecoveryRequired(false);
+                                        setStatus(t('recovery-ready'));
+                                    } else {
+                                        setRecoveryRequired(true);
+                                        setStatus(t('recovery-required'));
+                                        setError(getSafeErrorMessage(recoveryError, t));
+                                        return;
+                                    }
                                 }
                             }
 
@@ -585,7 +638,11 @@ function BackupPage() {
                                 uploadedZipRef.current = {
                                     txId: jobStatus.zipTxId,
                                     iv: jobStatus.zipIv || null,
-                                    merkleRoot: jobStatus.zipMerkleRoot || null
+                                    merkleRoot: jobStatus.zipMerkleRoot || null,
+                                    archiveContains: jobStatus.archiveContains || jobStatus.manifest?.archive?.contains || (Array.isArray(jobStatus.changedFileMetadata) ? [
+                                        ...jobStatus.changedFileMetadata.map(file => ({ path: file.path, hash: file.hash })),
+                                        ...(recoveryJournal?.internalArchiveContains || [])
+                                    ] : null)
                                 };
                                 updateRecoveryJournal({
                                     jobId: jobStatus.jobId,
@@ -596,6 +653,8 @@ function BackupPage() {
                                     zipTxId: jobStatus.zipTxId,
                                     zipIv: jobStatus.zipIv || null,
                                     zipMerkleRoot: jobStatus.zipMerkleRoot || null,
+                                    zipKeyVerifier: jobStatus.zipKeyVerifier || null,
+                                    internalArchiveContains: (jobStatus.archiveContains || []).filter(entry => entry.internal === true),
                                     manifestTxId: jobStatus.manifestTxId || null,
                                     backupTxHash: jobStatus.backupTxHash || null
                                 });
@@ -903,10 +962,33 @@ function BackupPage() {
                         }
                     }
 
+                    // Deletions are repository changes too. Represent them as an
+                    // encrypted internal ZIP entry; it is committed by archive.contains
+                    // but deliberately never added to manifest.paths/restored to GitHub.
+                    const currentPathSet = new Set(files.map(file => file.path));
+                    const deletedPaths = Object.keys(previousPaths).filter(filePath => !currentPathSet.has(filePath));
+                    if (deletedPaths.length > 0) {
+                        const markerBytes = new TextEncoder().encode(JSON.stringify({ format: 'PermRepo deletions v1', paths: deletedPaths }));
+                        const markerDigest = await crypto.subtle.digest('SHA-256', markerBytes);
+                        const markerHash = ethers.hexlify(new Uint8Array(markerDigest)).slice(2);
+                        const markerPath = `__permrepo_internal__/deletions-${crypto.randomUUID()}.json`;
+                        let markerBinary = '';
+                        for (let offset = 0; offset < markerBytes.length; offset += 0x8000) {
+                            markerBinary += String.fromCharCode(...markerBytes.subarray(offset, offset + 0x8000));
+                        }
+                        changedFiles.push({
+                            path: markerPath,
+                            hash: markerHash,
+                            size: markerBytes.length,
+                            content: btoa(markerBinary),
+                            internal: true
+                        });
+                    }
+
                     setCurrentPreviousBackupNumber(Number(metadata.backupCount || 0));
                     setFileInfo({
-                        count: changedFiles.length,
-                        sizeText: formatFileSize(changedFiles.reduce((sum, file) => sum + Number(file.size), 0)),
+                        count: changedFiles.filter(file => !file.internal).length + deletedPaths.length,
+                        sizeText: formatFileSize(changedFiles.filter(file => !file.internal).reduce((sum, file) => sum + Number(file.size), 0)),
                         loading: false
                     });
                     setChangedFilesForUpload(changedFiles);
@@ -943,7 +1025,7 @@ function BackupPage() {
             localStorage.removeItem(`permrepo-backup-tx-${repoStorageKey}`);
         } catch {}
         clearRecoveryJournal();
-        uploadedZipRef.current = { txId: null, iv: null, merkleRoot: null };
+        uploadedZipRef.current = { txId: null, iv: null, merkleRoot: null, archiveContains: null };
         uploadedManifestRef.current = { txId: null, manifest: null };
         setRecoveredJobData(null);
         setRecoveryRequired(false);
@@ -1041,13 +1123,25 @@ function BackupPage() {
 
                 // A new manifest must never relabel older ZIPs as encrypted by a different
                 // Master Key. Verify the candidate against the previous manifest first.
+                const enteredVerifier = await createMasterKeyVerifier(keyHex);
                 if (Number(backupCount) > 0) {
                     const previousVerifier = previousManifestRef.current?.encryption?.keyVerifier;
                     if (typeof previousVerifier !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(previousVerifier)) {
                         throw new Error(t('previous-key-verifier-missing'));
                     }
-                    const enteredVerifier = await createMasterKeyVerifier(keyHex);
                     if (enteredVerifier.toLowerCase() !== previousVerifier.toLowerCase()) {
+                        setError(t('master-key-mismatch'));
+                        setIsWorking(false);
+                        return;
+                    }
+                } else if (isRecoveryWithExistingZip) {
+                    const recoveryVerifier = recoveredJobData?.zipKeyVerifier ||
+                        recoveredJobData?.manifest?.encryption?.keyVerifier ||
+                        previousManifestRef.current?.encryption?.keyVerifier;
+                    if (typeof recoveryVerifier !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(recoveryVerifier)) {
+                        throw new Error(t('previous-key-verifier-missing'));
+                    }
+                    if (enteredVerifier.toLowerCase() !== recoveryVerifier.toLowerCase()) {
                         setError(t('master-key-mismatch'));
                         setIsWorking(false);
                         return;
@@ -1056,13 +1150,15 @@ function BackupPage() {
                 masterKeyRef.current = keyHex;
             }
             
+            const zipKeyVerifier = await createMasterKeyVerifier(keyHex);
             await uploadZip(
                 preparedJobId,
                 changedFilesForUpload,
                 unchangedFilesForUpload,
                 keyHex,
                 client,
-                signerInstance
+                signerInstance,
+                zipKeyVerifier
             );
             
         } catch (e) {
@@ -1086,7 +1182,8 @@ function BackupPage() {
         unchangedFiles,
         keyHex,
         client,
-        signerInstance
+        signerInstance,
+        zipKeyVerifier
     ) => {
         if (!config || !jobId || !nftInfo.tokenId) {
             setError(t('backup-session-invalid'));
@@ -1098,8 +1195,16 @@ function BackupPage() {
 
         try {
             let zipTxId = uploadedZipRef.current.txId || recoveredJobData?.zipTxId;
-            let iv = uploadedZipRef.current.iv;
-            let merkleRoot = uploadedZipRef.current.merkleRoot;
+            let iv = uploadedZipRef.current.iv || recoveredJobData?.zipIv || null;
+            let merkleRoot = uploadedZipRef.current.merkleRoot || recoveredJobData?.zipMerkleRoot || recoveredJobData?.manifest?.merkleRoot || null;
+            let archiveContains = uploadedZipRef.current.archiveContains || recoveredJobData?.archiveContains || recoveredJobData?.manifest?.archive?.contains || null;
+
+            // Never create a manifest around an existing encrypted ZIP without its
+            // original AES-GCM IV. In a recovered job this value may only survive in
+            // the local recovery journal rather than the in-memory upload ref.
+            if (zipTxId && (!iv || iv.length !== 12)) {
+                throw new Error(t('recovery-upload-incomplete'));
+            }
 
             // Saglabājam zināmo ZIP ID Redis arī atkopšanas laikā. Endpoint ir
             // idempotents, tāpēc tas droši salāgo lokālo žurnālu ar servera stāvokli.
@@ -1112,14 +1217,16 @@ function BackupPage() {
                     cryptoVersion: 1,
                     zipTxId,
                     zipIv: iv ? Array.from(iv) : null,
-                    zipMerkleRoot: merkleRoot || null
+                    zipMerkleRoot: merkleRoot || null,
+                    ...(archiveContains ? { internalArchiveContains: archiveContains.filter(entry => entry.internal === true) } : {}),
+                    ...(recoveredJobData?.zipKeyVerifier ? { zipKeyVerifier: recoveredJobData.zipKeyVerifier } : {})
                 })) {
                     throw new Error(t('recovery-journal-save-failed'));
                 }
                 await apiJsonWithRetry('/api/save-zip-tx', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ jobId, zipTxId, iv, merkleRoot, cryptoVersion: 1 })
+                    body: JSON.stringify({ jobId, zipTxId, iv, merkleRoot, cryptoVersion: 1, ...(archiveContains ? { archiveContains } : {}), ...(recoveredJobData?.status === 'failed' && !recoveredJobData?.zipTxId && recoveredJobData?.zipKeyVerifier ? { zipKeyVerifier: recoveredJobData.zipKeyVerifier } : {}) })
                 });
             } else if (!zipTxId) {
                 await apiJson('/api/start-zip-upload', {
@@ -1129,6 +1236,7 @@ function BackupPage() {
                 });
 
                 const zip = new JSZip();
+                archiveContains = changedFiles.map(file => ({ path: file.path, hash: file.hash, ...(file.internal ? { internal: true } : {}) }));
 
                 for (const file of changedFiles) {
                     if (typeof file.content !== 'string') {
@@ -1190,7 +1298,8 @@ function BackupPage() {
                 }
 
                 zipTxId = zipResult.id;
-                uploadedZipRef.current = { txId: zipTxId, iv, merkleRoot };
+                uploadedZipRef.current = { txId: zipTxId, iv, merkleRoot, archiveContains };
+                updateRecoveryJournal({ internalArchiveContains: archiveContains.filter(entry => entry.internal === true), zipKeyVerifier });
                 // Kritiska secība: lokālais kontrolpunkts pirms Redis pieprasījuma.
                 if (!updateRecoveryJournal({
                     jobId,
@@ -1200,7 +1309,9 @@ function BackupPage() {
                     cryptoVersion: 1,
                     zipTxId,
                     zipIv: iv ? Array.from(iv) : null,
-                    zipMerkleRoot: merkleRoot || null
+                    zipMerkleRoot: merkleRoot || null,
+                    zipKeyVerifier,
+                    internalArchiveContains: archiveContains.filter(entry => entry.internal === true)
                 })) {
                     throw new Error(t('recovery-journal-save-failed'));
                 }
@@ -1213,7 +1324,9 @@ function BackupPage() {
                         zipTxId,
                         iv: iv ? Array.from(iv) : null,
                         merkleRoot: merkleRoot || null,
-                        cryptoVersion: 1
+                        cryptoVersion: 1,
+                        zipKeyVerifier,
+                        archiveContains
                     })
                 });
             }
@@ -1280,6 +1393,7 @@ function BackupPage() {
                         history.push({
                             backupNumber: prevBackupNumber,
                             manifestId: currentPreviousManifestId,
+                            merkleRoot: nftInfo.lastMerkleRoot || previousManifestRef.current?.merkleRoot || null,
                             url: `/raw/${encodeURIComponent(currentPreviousManifestId)}`
                         });
                     }
@@ -1311,17 +1425,22 @@ function BackupPage() {
                     archive: {
                         id: zipTxId,
                         url: `/raw/${encodeURIComponent(zipTxId)}`,
-                        contains: changedFiles.map(file => ({
+                        contains: archiveContains || changedFiles.map(file => ({
                             path: file.path,
-                            hash: file.hash
+                            hash: file.hash,
+                            ...(file.internal ? { internal: true } : {})
                         }))
                     },
+                    merkleRoot,
                     paths: Object.create(null),
                     history
                 };
 
+                const internalArchivePaths = new Set((manifest.archive.contains || []).filter(entry => entry.internal === true).map(entry => entry.path));
                 for (const file of changedFiles) {
-                    manifest.paths[file.path] = { id: zipTxId, hash: file.hash };
+                    if (!file.internal && !internalArchivePaths.has(file.path)) {
+                        manifest.paths[file.path] = { id: zipTxId, hash: file.hash };
+                    }
                 }
 
                 for (const [filePath, info] of Object.entries(unchangedFiles)) {
@@ -1556,15 +1675,46 @@ function BackupPage() {
             setLastStatusData({ type: 'success', key: 'backup-complete' });
         } catch (e) {
             if (submittedBackupTxHashRef.current) {
-                setRecoveryRequired(true);
-                setStatus(t('recovery-required'));
-                setRecoveredJobData(prev => ({
-                    ...prev,
-                    jobId,
-                    backupTxHash: submittedBackupTxHashRef.current,
-                    manifestTxId: manifestTxId,
-                    tokenId: nftInfo.tokenId
-                }));
+                const submittedTxHash = submittedBackupTxHashRef.current;
+                let safelyRetryable = false;
+                try {
+                    const failureRecovery = await apiJson('/api/fail-backup', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ jobId, txHash: submittedTxHash, error: getSafeErrorMessage(e, t) })
+                    });
+                    safelyRetryable = failureRecovery?.status === 'manifest-uploaded' && failureRecovery?.retryable === true;
+                } catch {
+                    // Pending/successful/unknown transactions remain in recovery state.
+                }
+
+                if (safelyRetryable) {
+                    submittedBackupTxHashRef.current = null;
+                    try {
+                        localStorage.removeItem(`permrepo-backup-tx-${repoStorageKey}`);
+                        updateRecoveryJournal({ stage: 'manifest-uploaded', backupTxHash: null });
+                    } catch {}
+                    setRecoveryRequired(false);
+                    setStatus(t('recovery-ready'));
+                    setRecoveredJobData(prev => ({
+                        ...prev,
+                        jobId,
+                        status: 'manifest-uploaded',
+                        backupTxHash: null,
+                        manifestTxId,
+                        tokenId: nftInfo.tokenId
+                    }));
+                } else {
+                    setRecoveryRequired(true);
+                    setStatus(t('recovery-required'));
+                    setRecoveredJobData(prev => ({
+                        ...prev,
+                        jobId,
+                        backupTxHash: submittedTxHash,
+                        manifestTxId: manifestTxId,
+                        tokenId: nftInfo.tokenId
+                    }));
+                }
             } else {
                 try {
                     const failResponse = await apiJson('/api/fail-backup', {

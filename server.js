@@ -1465,6 +1465,39 @@ function validateJobTxInput(jobId, txId) {
     }
 }
 
+function calculateArchiveMerkleRoot(contains) {
+    if (!Array.isArray(contains)) throw new Error('Manifesta archive.contains nav derīgs.');
+    if (contains.length === 0) return `0x${'0'.repeat(64)}`;
+    const hashes = contains.map(entry => {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
+            typeof entry.hash !== 'string' || !/^[0-9a-fA-F]{64}$/.test(entry.hash)) {
+            throw new Error('Manifesta archive.contains satur nederīgu faila hash.');
+        }
+        if (typeof entry.path !== 'string' || entry.path.length < 1 || entry.path.length > 1000 ||
+            entry.path.startsWith('/') || entry.path.startsWith('\\') || /^[a-zA-Z]:/.test(entry.path) ||
+            entry.path.includes('\\') || entry.path.split('/').some(part => part === '..' || part === '.') ||
+            /[\x00-\x1f]/.test(entry.path)) {
+            throw new Error('Manifesta archive.contains satur nederīgu ceļu.');
+        }
+        return ethers.keccak256(ethers.toUtf8Bytes(entry.hash));
+    });
+    return ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(['bytes32[]'], [hashes]));
+}
+
+function validateArchiveContains(contains) {
+    if (!Array.isArray(contains)) throw new Error('Manifesta archive.contains nav derīgs masīvs.');
+    const seenPaths = new Set();
+    for (const entry of contains) {
+        calculateArchiveMerkleRoot([entry]);
+        if (seenPaths.has(entry.path)) throw new Error('Manifesta archive.contains satur dublētu ceļu.');
+        seenPaths.add(entry.path);
+        if (entry.internal !== undefined && entry.internal !== true && entry.internal !== false) {
+            throw new Error('Manifesta archive.contains internal karodziņš nav derīgs.');
+        }
+    }
+    return true;
+}
+
 function validateManifest(manifest) {
     if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
         throw new Error('Manifests nav derīgs objekts.');
@@ -1487,9 +1520,8 @@ function validateManifest(manifest) {
         !/^\d+$/.test(String(repositoryId)) || BigInt(repositoryId) <= 0n) {
         throw new Error('Manifesta repositoryId nav derīgs.');
     }
-    if (!manifest.paths || typeof manifest.paths !== 'object' || Array.isArray(manifest.paths) ||
-        Object.keys(manifest.paths).length === 0) {
-        throw new Error('Manifesta paths nav derīgs vai ir tukšs.');
+    if (!manifest.paths || typeof manifest.paths !== 'object' || Array.isArray(manifest.paths)) {
+        throw new Error('Manifesta paths nav derīgs.');
     }
 
     const encryption = manifest.encryption;
@@ -1533,6 +1565,19 @@ function validateManifest(manifest) {
     if (manifest.archive && typeof manifest.archive === 'object' &&
         manifest.archive.id !== undefined && !validateArweaveId(manifest.archive.id)) {
         throw new Error('Manifesta archive ID nav derīgs.');
+    }
+    if (manifest.archive?.contains !== undefined) {
+        validateArchiveContains(manifest.archive.contains);
+        const calculatedRoot = calculateArchiveMerkleRoot(manifest.archive.contains);
+        if (manifest.merkleRoot !== undefined &&
+            (typeof manifest.merkleRoot !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(manifest.merkleRoot) ||
+             calculatedRoot.toLowerCase() !== manifest.merkleRoot.toLowerCase())) {
+            throw new Error('Manifesta Merkle root nesakrīt ar archive.contains.');
+        }
+    }
+    if (Object.keys(manifest.paths).length === 0 &&
+        !manifest.archive?.contains?.some(entry => entry.internal === true)) {
+        throw new Error('Manifesta paths ir tukšs bez dzēšanas marķiera.');
     }
     return true;
 }
@@ -2087,12 +2132,8 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
             req.body.defaultBranch || repoData.defaultBranch
         );
 
-        if (archiveMetadata.blobs.length === 0) {
-            return res.status(400).json({
-                success: false,
-                error: 'Repozitorijā nav failu.'
-            });
-        }
+        // Empty repositories are valid snapshots too. The client compares the
+        // current tree with the previous manifest and records deletions if any.
 
         let maxFileBytes = 0;
 
@@ -2520,7 +2561,7 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
         assertSameOrigin(req);
         if (!requireGithubSession(req, res)) return;
 
-        const { jobId, zipTxId, iv, merkleRoot, cryptoVersion } = req.body;
+        const { jobId, zipTxId, iv, merkleRoot, cryptoVersion, zipKeyVerifier, archiveContains } = req.body;
 
         validateJobTxInput(jobId, zipTxId);
         if (cryptoVersion !== 1) {
@@ -2529,6 +2570,11 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
                 error: 'Neatbalstīta ZIP šifrēšanas versija. Atjaunini backup platformu.'
             });
         }
+        if (zipKeyVerifier !== undefined &&
+            (typeof zipKeyVerifier !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(zipKeyVerifier))) {
+            return res.status(400).json({ success: false, error: 'Nederīgs ZIP Master Key verifikators.' });
+        }
+        if (archiveContains !== undefined) validateArchiveContains(archiveContains);
 
         // ✅ #2 LABOJUMS: Stingrāka IV validācija
         // IV validācija (ja padots)
@@ -2597,9 +2643,22 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
                     if (job.zipIv && normalizedIV && JSON.stringify(job.zipIv) !== JSON.stringify(normalizedIV)) {
                         throw new Error('Atkārtotajā ZIP saglabāšanā IV nesakrīt.');
                     }
+                    if (job.zipKeyVerifier && zipKeyVerifier && job.zipKeyVerifier.toLowerCase() !== zipKeyVerifier.toLowerCase()) {
+                        throw new Error('Atkārtotajā ZIP saglabāšanā Master Key verifikators nesakrīt.');
+                    }
+                    if (job.archiveContains && archiveContains && JSON.stringify(job.archiveContains) !== JSON.stringify(archiveContains)) {
+                        throw new Error('Atkārtotajā ZIP saglabāšanā archive.contains nesakrīt.');
+                    }
+                    if (!job.zipKeyVerifier && zipKeyVerifier) {
+                        throw new Error('Esošam ZIP nevar piešķirt jaunu Master Key verifikatoru.');
+                    }
                     const missingZipMetadata = {};
                     if (!job.zipIv && normalizedIV) missingZipMetadata.zipIv = normalizedIV;
                     if (!job.zipMerkleRoot && normalizedMerkleRoot) missingZipMetadata.zipMerkleRoot = normalizedMerkleRoot;
+                    if (!job.archiveContains && archiveContains && normalizedMerkleRoot &&
+                        calculateArchiveMerkleRoot(archiveContains).toLowerCase() === normalizedMerkleRoot.toLowerCase()) {
+                        missingZipMetadata.archiveContains = archiveContains;
+                    }
                     if (Object.keys(missingZipMetadata).length) {
                         missingZipMetadata.updatedAt = Date.now();
                         await updateJob(jobId, missingZipMetadata, JOB_TTL_SECONDS);
@@ -2628,6 +2687,8 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
                     cryptoVersion: 1,
                     zipIv: normalizedIV,
                     zipMerkleRoot: normalizedMerkleRoot,
+                    ...(zipKeyVerifier ? { zipKeyVerifier } : {}),
+                    ...(archiveContains ? { archiveContains } : {}),
                     status: recoveredStatus,
                     error: null,
                     failedAt: null,
@@ -2659,6 +2720,8 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
                 cryptoVersion: 1,
                 zipIv: normalizedIV,
                 zipMerkleRoot: normalizedMerkleRoot,
+                ...(zipKeyVerifier ? { zipKeyVerifier } : {}),
+                ...(archiveContains ? { archiveContains } : {}),
                 status: 'zip-uploaded',
                 zipUploadedAt: Date.now(),
                 updatedAt: Date.now()
@@ -2798,6 +2861,18 @@ app.post('/api/save-manifest-tx', backupLimiter, async (req, res) => {
                 if (manifest.archive?.id !== job.zipTxId) {
                     throw new Error('Manifesta archive ID nesakrīt ar ZIP transakciju.');
                 }
+                const recoveryManifestIv = manifest.encryption?.ivs?.[job.zipTxId];
+                if (!Array.isArray(job.zipIv) || !Array.isArray(recoveryManifestIv) ||
+                    JSON.stringify(job.zipIv) !== JSON.stringify(recoveryManifestIv)) {
+                    throw new Error('Manifesta ZIP IV nesakrīt ar saglabāto ZIP IV.');
+                }
+                const recoveryArchiveRoot = calculateArchiveMerkleRoot(manifest.archive?.contains || []);
+                if (!job.zipMerkleRoot || recoveryArchiveRoot.toLowerCase() !== job.zipMerkleRoot.toLowerCase()) {
+                    throw new Error('Manifesta archive.contains nesakrīt ar ZIP posmā saglabāto Merkle root.');
+                }
+                if (job.archiveContains && JSON.stringify(job.archiveContains) !== JSON.stringify(manifest.archive.contains)) {
+                    throw new Error('Manifesta archive.contains nesakrīt ar ZIP augšupielādes kontrolpunktu.');
+                }
 
                 await updateJob(jobId, {
                     manifestTxId,
@@ -2832,6 +2907,18 @@ app.post('/api/save-manifest-tx', backupLimiter, async (req, res) => {
                 throw new Error(
                     'Manifesta archive ID nesakrīt ar ZIP transakciju.'
                 );
+            }
+            const manifestZipIv = manifest.encryption?.ivs?.[job.zipTxId];
+            if (!Array.isArray(job.zipIv) || !Array.isArray(manifestZipIv) ||
+                JSON.stringify(job.zipIv) !== JSON.stringify(manifestZipIv)) {
+                throw new Error('Manifesta ZIP IV nesakrīt ar saglabāto ZIP IV.');
+            }
+            const manifestArchiveRoot = calculateArchiveMerkleRoot(manifest.archive?.contains || []);
+            if (!job.zipMerkleRoot || manifestArchiveRoot.toLowerCase() !== job.zipMerkleRoot.toLowerCase()) {
+                throw new Error('Manifesta archive.contains nesakrīt ar ZIP posmā saglabāto Merkle root.');
+            }
+            if (job.archiveContains && JSON.stringify(job.archiveContains) !== JSON.stringify(manifest.archive.contains)) {
+                throw new Error('Manifesta archive.contains nesakrīt ar ZIP augšupielādes kontrolpunktu.');
             }
 
             await updateJob(jobId, {
@@ -2961,6 +3048,15 @@ app.post('/api/start-blockchain-finalize', backupLimiter, async (req, res) => {
 
             if (job.manifest?.archive?.id !== job.zipTxId) {
                 throw new Error('Manifesta archive ID nesakrīt ar ZIP.');
+            }
+            const finalizedArchiveRoot = calculateArchiveMerkleRoot(job.manifest.archive?.contains || []);
+            if (!job.zipMerkleRoot || finalizedArchiveRoot.toLowerCase() !== job.zipMerkleRoot.toLowerCase() ||
+                finalizedArchiveRoot.toLowerCase() !== merkleRoot.toLowerCase()) {
+                throw new Error('Manifesta archive.contains Merkle root nesakrīt ar blockchain finalizāciju.');
+            }
+            const finalizedIv = job.manifest.encryption?.ivs?.[job.zipTxId];
+            if (!Array.isArray(job.zipIv) || !Array.isArray(finalizedIv) || JSON.stringify(job.zipIv) !== JSON.stringify(finalizedIv)) {
+                throw new Error('Manifesta ZIP IV nesakrīt ar saglabāto ZIP IV.');
             }
 
             const expectedManifestURI = `ar://${job.manifestTxId}`;
@@ -3161,7 +3257,11 @@ app.post('/api/complete-backup', backupLimiter, async (req, res) => {
             }
 
             if (receipt.status !== 1) {
-                throw new Error('Transakcija neizdevās.');
+                // Let /api/fail-backup inspect the same receipt and perform the
+                // explicit retryable state transition. Do not mutate the job here.
+                throw new Error(receipt.status === 0
+                    ? 'Blockchain transakcija neizdevās; nepieciešama droša finalizācijas atkopšana.'
+                    : 'Transakcijas statuss nav sekmīgs.');
             }
 
             if (receipt.to?.toLowerCase() !== NFT_ADDRESS.toLowerCase()) {
@@ -3258,13 +3358,16 @@ app.post('/api/fail-backup', backupLimiter, async (req, res) => {
         assertSameOrigin(req);
         if (!requireGithubSession(req, res)) return;
 
-        const { jobId, error: jobError } = req.body;
+        const { jobId, error: jobError, txHash: suppliedTxHash } = req.body;
 
         if (!validateJobId(jobId)) {
             return res.status(400).json({
                 success: false,
                 error: 'Nederīgs job ID.'
             });
+        }
+        if (suppliedTxHash !== undefined && !validateTxHash(suppliedTxHash)) {
+            return res.status(400).json({ success: false, error: 'Nederīgs transakcijas hash.' });
         }
 
         return await withJobLock(jobId, async () => {
@@ -3288,17 +3391,45 @@ app.post('/api/fail-backup', backupLimiter, async (req, res) => {
                 });
             }
 
-            // ✅ Neļauj failed no blockchain-finalizing ar backupTxHash
-            if (
-                job.status === 'blockchain-finalizing' &&
-                job.backupTxHash
-            ) {
-                return res.status(400).json({
-                    success: false,
-                    error: 'Blockchain transaction exists — recovery required, not failed.',
-                    recoveryRequired: true,
-                    backupTxHash: job.backupTxHash
-                });
+            // A known transaction must not be marked failed while pending or successful.
+            // If its receipt proves status 0, however, allow recovery to leave the
+            // finalizing state and start a new attempt.
+            if (job.status === 'blockchain-finalizing' && (job.backupTxHash || suppliedTxHash)) {
+                if (job.backupTxHash && suppliedTxHash && job.backupTxHash.toLowerCase() !== suppliedTxHash.toLowerCase()) {
+                    return res.status(400).json({ success: false, error: 'Transakcijas hash nesakrīt ar saglabāto hash.' });
+                }
+                const txHashToCheck = job.backupTxHash || suppliedTxHash;
+                let receipt = null;
+                try { receipt = await getProvider().getTransactionReceipt(txHashToCheck); }
+                catch { /* Unknown RPC result: preserve recovery state. */ }
+                if (!receipt || receipt.status === 1) {
+                    if (!job.backupTxHash && suppliedTxHash) {
+                        await updateJob(jobId, { backupTxHash: suppliedTxHash, updatedAt: Date.now() }, JOB_TTL_SECONDS);
+                    }
+                    return res.status(400).json({
+                        success: false,
+                        error: 'Blockchain transaction is pending or successful — recovery required, not failed.',
+                        recoveryRequired: true,
+                        backupTxHash: txHashToCheck
+                    });
+                }
+                if (receipt.status !== 0) {
+                    return res.status(400).json({
+                        success: false,
+                        error: 'Blockchain transaction outcome is unknown — recovery required.',
+                        recoveryRequired: true,
+                        backupTxHash: txHashToCheck
+                    });
+                }
+                await updateJob(jobId, {
+                    status: 'manifest-uploaded',
+                    backupTxHash: null,
+                    error: 'Blockchain transakcija tika atcelta (receipt status 0).',
+                    failedAt: null,
+                    retryableBlockchainFailure: true,
+                    updatedAt: Date.now()
+                }, JOB_TTL_SECONDS);
+                return res.json({ success: true, status: 'manifest-uploaded', retryable: true });
             }
 
             await updateJob(jobId, {

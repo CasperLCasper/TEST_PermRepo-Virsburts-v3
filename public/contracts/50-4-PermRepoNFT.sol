@@ -208,7 +208,7 @@ contract PermRepoNFT is ERC721URIStorage, EIP712, Ownable2Step, ReentrancyGuard 
         if (newOwner == address(0)) revert ZeroAddress();
 
         _migrationInProgress = true;
-        _transfer(currentOwner, newOwner, tokenId);
+        _safeTransfer(currentOwner, newOwner, tokenId, '');
         _migrationInProgress = false;
 
         emit NFTMigrated(tokenId, currentOwner, newOwner);

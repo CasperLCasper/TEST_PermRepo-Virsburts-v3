@@ -44,7 +44,9 @@ const VALID_TRANSITIONS = {
     'zip-uploaded': ['manifest-uploading', 'failed'],
     'manifest-uploading': ['manifest-uploaded', 'failed'],
     'manifest-uploaded': ['blockchain-finalizing', 'failed'],
-    'blockchain-finalizing': ['completed', 'failed'],
+    // A reverted, mined transaction may safely return to manifest-uploaded
+    // after the server verifies receipt.status === 0.
+    'blockchain-finalizing': ['completed', 'failed', 'manifest-uploaded'],
     'completed': [],
     'failed': [
         'prepared',

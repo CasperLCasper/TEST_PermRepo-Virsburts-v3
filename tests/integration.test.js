@@ -9,7 +9,7 @@ const manifestRoute = routeSource("app.post('/api/save-manifest-tx'");
 test('I01 — backup platformas kritiskie faili atrodas repozitorijā', () => {
   for (const file of [
     'server.js', 'accounting-redis.js', 'src/BackupPage.jsx',
-    'public/contracts/50-4-PermRepoNFT.sol', 'public/contracts/10-PermRepo-Subscription.sol'
+    'public/contracts/50-5-PermRepoNFT.sol', 'public/contracts/10-PermRepo-Subscription.sol'
   ]) assert.ok(fs.existsSync(path.join(root, file)), `Trūkst backup platformas faila: ${file}`);
 });
 

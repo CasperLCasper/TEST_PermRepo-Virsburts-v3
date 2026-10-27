@@ -54,7 +54,7 @@ test('P05 — svarīgākie servera API ceļi paliek definēti', () => {
 });
 
 test('P06 — NFT līgums saglabā migrāciju, ne-tirgojamu NFT aizsardzību un backup metadatu lasītājus', () => {
-  const source = read('public/contracts/50-5-PermRepoNFT.sol');
+  const source = read('public/contracts/50-4-PermRepoNFT.sol');
   assert.match(source, /function migrateNFT\(uint256 tokenId, address newOwner\) external nonReentrant/);
   assert.match(source, /function approve\(address, uint256\) public pure override/);
   assert.match(source, /function setApprovalForAll\(address, bool\) public pure override/);

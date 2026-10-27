@@ -15,6 +15,7 @@ test('B01a — manifests ar vairākām ZIP atsaucēm un atbilstošiem IV tiek pi
   const m = validManifest();
   m.paths['src/app.js'] = { zipId: OTHER_ZIP_ID, hash: 'b'.repeat(64) };
   m.encryption.ivs[OTHER_ZIP_ID] = Array.from({ length: 12 }, (_, i) => i);
+  m.archive.contains.push({ path: 'src/app.js', hash: 'b'.repeat(64) });
   assert.equal(validateManifest(m), true);
 });
 
@@ -161,4 +162,85 @@ test('B07c — iepriekšējā manifesta fetch aizliedz HTTP pāradresācijas', a
   });
   await loader(`ar://${'A'.repeat(43)}`);
   assert.equal(options.redirect, 'error');
+});
+
+// ✅ R01: Jauni testi — archive.contains un merkleRoot obligāti
+
+test('B08 — manifests bez archive.contains tiek noraidīts (R01)', () => {
+  const m = validManifest();
+  delete m.archive.contains;
+  assert.throws(() => validateManifest(m), /archive\.contains/);
+});
+
+test('B08a — manifests ar tukšu archive.contains tiek noraidīts (R01)', () => {
+  const m = validManifest();
+  m.archive.contains = [];
+  assert.throws(() => validateManifest(m), /archive\.contains/);
+});
+
+test('B08b — manifests bez merkleRoot tiek noraidīts (R01)', () => {
+  const m = validManifest();
+  delete m.merkleRoot;
+  assert.throws(() => validateManifest(m), /merkleRoot/);
+});
+
+test('B08c — manifests ar nederīgu merkleRoot formātu tiek noraidīts (R01)', () => {
+  const m = validManifest();
+  m.merkleRoot = '0x1234';
+  assert.throws(() => validateManifest(m), /merkleRoot/);
+});
+
+test('B08d — archive.contains hash nesakritība ar paths tiek noraidīta (R01)', () => {
+  const m = validManifest();
+  m.archive.contains = [{ path: 'README.md', hash: 'b'.repeat(64) }];
+  assert.throws(() => validateManifest(m), /hash nesakrīt/);
+});
+
+test('B08e — archive.contains ceļš, kas nav paths, tiek noraidīts (R01)', () => {
+  const m = validManifest();
+  m.archive.contains = [{ path: 'other.txt', hash: 'a'.repeat(64) }];
+  assert.throws(() => validateManifest(m), /hash nesakrīt/);
+});
+
+test('B08f — dublēts archive.contains ceļš tiek noraidīts (R01)', () => {
+  const m = validManifest();
+  m.archive.contains = [
+    { path: 'README.md', hash: 'a'.repeat(64) },
+    { path: 'README.md', hash: 'a'.repeat(64) }
+  ];
+  assert.throws(() => validateManifest(m), /dublētu/);
+});
+
+// ✅ B03: deletedFiles testi
+
+test('B09 — manifests ar derīgu deletedFiles tiek pieņemts (B03)', () => {
+  const m = validManifest();
+  m.deletedFiles = ['old.txt'];
+  assert.equal(validateManifest(m), true);
+});
+
+test('B09a — deletedFiles nevar pārklāties ar paths (B03)', () => {
+  const m = validManifest();
+  m.deletedFiles = ['README.md'];
+  assert.throws(() => validateManifest(m), /nevar būt gan paths, gan deletedFiles/);
+});
+
+test('B09b — deletedFiles ar nederīgu ceļu tiek noraidīts (B03)', () => {
+  for (const badPath of ['../outside.txt', '/etc/passwd', 'C:\\Windows', 'bad\u0000name']) {
+    const m = validManifest();
+    m.deletedFiles = [badPath];
+    assert.throws(() => validateManifest(m), `Ceļam jābūt noraidītam: ${JSON.stringify(badPath)}`);
+  }
+});
+
+test('B09c — deletedFiles nav masīvs tiek noraidīts (B03)', () => {
+  const m = validManifest();
+  m.deletedFiles = 'old.txt';
+  assert.throws(() => validateManifest(m));
+});
+
+test('B09d — deletedFiles ar pārāk garu ceļu tiek noraidīts (B03)', () => {
+  const m = validManifest();
+  m.deletedFiles = ['x'.repeat(1001)];
+  assert.throws(() => validateManifest(m));
 });

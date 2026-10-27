@@ -164,7 +164,7 @@ test('B07c — iepriekšējā manifesta fetch aizliedz HTTP pāradresācijas', a
   assert.equal(options.redirect, 'error');
 });
 
-// ✅ R01: Jauni testi — archive.contains un merkleRoot obligāti
+// ✅ R01: archive.contains un merkleRoot obligāti
 
 test('B08 — manifests bez archive.contains tiek noraidīts (R01)', () => {
   const m = validManifest();

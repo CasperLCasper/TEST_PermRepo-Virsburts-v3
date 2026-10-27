@@ -10,6 +10,9 @@ import crypto from 'crypto';
 let redis = null;
 
 const DEFAULT_JOB_TTL = Number(process.env.JOB_TTL_SECONDS || 86400);
+const COMPLETED_JOB_TTL = Number(process.env.COMPLETED_JOB_TTL_SECONDS || 30 * 24 * 60 * 60);
+const FAILED_JOB_TTL = Number(process.env.FAILED_JOB_TTL_SECONDS || 90 * 24 * 60 * 60);
+const ACTIVE_JOB_TTL = Number(process.env.ACTIVE_JOB_TTL_SECONDS || 7 * 24 * 60 * 60);
 const JOB_LOCK_TTL = Number(process.env.JOB_LOCK_TTL_SECONDS || 600);
 
 function jobKey(jobId) {
@@ -18,6 +21,45 @@ function jobKey(jobId) {
 
 function jobLockKey(jobId) {
     return `permrepo:joblock:${jobId}`;
+}
+
+// -----------------------------------------------------------------------------
+// TTL noteikšana pēc job stāvokļa
+// -----------------------------------------------------------------------------
+
+/**
+ * Nosaka TTL sekundes, ņemot vērā job statusu un vai tam ir neatrisināta
+ * blockchain transakcija. Neveiksmīgi darbi ar neatrisinātu backupTxHash
+ * netiek automātiski dzēsti — tie ir vienīgais pierādījums par iespējamo
+ * on-chain stāvokli.
+ */
+export function resolveJobTtl(job, fallbackTtl = DEFAULT_JOB_TTL) {
+    const status = job?.status;
+
+    if (status === 'completed') {
+        return COMPLETED_JOB_TTL;
+    }
+
+    if (status === 'failed') {
+        if (typeof job?.backupTxHash === 'string' && job.backupTxHash.length > 0) {
+            // Neatrisināta blockchain transakcija — neļauj automātiski dzēst.
+            return 0;
+        }
+        return FAILED_JOB_TTL;
+    }
+
+    if (
+        status === 'prepared' ||
+        status === 'zip-uploading' ||
+        status === 'zip-uploaded' ||
+        status === 'manifest-uploading' ||
+        status === 'manifest-uploaded' ||
+        status === 'blockchain-finalizing'
+    ) {
+        return ACTIVE_JOB_TTL > 0 ? ACTIVE_JOB_TTL : fallbackTtl;
+    }
+
+    return fallbackTtl;
 }
 
 // -----------------------------------------------------------------------------
@@ -35,9 +77,6 @@ const VALID_JOB_STATUSES = [
     'failed'
 ];
 
-// ✅ Pilns state machine
-// ✅ #1 LABOJUMS: failed → zip-uploaded un failed → manifest-uploaded
-// (recovery pēc pārtraukta ZIP/manifesta ieraksta)
 const VALID_TRANSITIONS = {
     'prepared': ['zip-uploading', 'failed'],
     'zip-uploading': ['zip-uploaded', 'failed'],
@@ -63,26 +102,26 @@ export function validateStateTransition(currentStatus, newStatus) {
             `Nederīgs pašreizējais status: ${currentStatus}`
         );
     }
-    
+
     if (!VALID_JOB_STATUSES.includes(newStatus)) {
         throw new Error(
             `Nederīgs jaunais status: ${newStatus}`
         );
     }
-    
+
     if (currentStatus === newStatus) {
         return true;
     }
-    
+
     const allowed = VALID_TRANSITIONS[currentStatus] || [];
-    
+
     if (!allowed.includes(newStatus)) {
         throw new Error(
             `Nederīga state pāreja: ${currentStatus} → ${newStatus}. ` +
             `Atļautās: ${allowed.join(', ') || 'nav'}`
         );
     }
-    
+
     return true;
 }
 
@@ -119,13 +158,78 @@ function requireRedis() {
 }
 
 // -----------------------------------------------------------------------------
+// Lua skripti atomiskām operācijām
+// -----------------------------------------------------------------------------
+
+// Atomiski atjaunina job JSON, ja versija sakrīt. Ja versija nesakrīt,
+// atgriež 0 un klients mēģina vēlreiz pēc svaigas nolasīšanas.
+const UPDATE_JOB_LUA = `
+local key = KEYS[1]
+local expectedVersion = tonumber(ARGV[1])
+local nextJson = ARGV[2]
+local ttl = tonumber(ARGV[3])
+local currentRaw = redis.call("GET", key)
+if not currentRaw then
+    return -1
+end
+local ok, current = pcall(cjson.decode, currentRaw)
+if not ok then
+    return -2
+end
+local currentVersion = tonumber(current["version"] or 0)
+if currentVersion ~= expectedVersion then
+    return 0
+end
+if ttl > 0 then
+    redis.call("SET", key, nextJson, "EX", ttl)
+else
+    redis.call("SET", key, nextJson)
+end
+return 1
+`;
+
+// Atomiski atjaunina job JSON tikai tad, ja slēdzenes īpašnieks sakrīt.
+// Tas novērš situāciju, kur zaudētas slēdzenes dēļ kāds cits process jau
+// raksta job stāvokli, bet mēs to pārrakstām.
+const UPDATE_JOB_LOCKED_LUA = `
+local jobKey = KEYS[1]
+local lockKey = KEYS[2]
+local expectedVersion = tonumber(ARGV[1])
+local nextJson = ARGV[2]
+local ttl = tonumber(ARGV[3])
+local lockToken = ARGV[4]
+local currentLock = redis.call("GET", lockKey)
+if currentLock ~= lockToken then
+    return -3
+end
+local currentRaw = redis.call("GET", jobKey)
+if not currentRaw then
+    return -1
+end
+local ok, current = pcall(cjson.decode, currentRaw)
+if not ok then
+    return -2
+end
+local currentVersion = tonumber(current["version"] or 0)
+if currentVersion ~= expectedVersion then
+    return 0
+end
+if ttl > 0 then
+    redis.call("SET", jobKey, nextJson, "EX", ttl)
+else
+    redis.call("SET", jobKey, nextJson)
+end
+return 1
+`;
+
+// -----------------------------------------------------------------------------
 // Job operācijas
 // -----------------------------------------------------------------------------
 
 export async function createJob(
     jobId,
     job,
-    ttlSeconds = DEFAULT_JOB_TTL
+    ttlSeconds = null
 ) {
     const client = requireRedis();
 
@@ -153,7 +257,11 @@ export async function createJob(
         );
     }
 
-    const ttl = Number(ttlSeconds);
+    const ttl = Number(
+        ttlSeconds !== null && ttlSeconds !== undefined
+            ? ttlSeconds
+            : resolveJobTtl(job)
+    );
 
     if (
         !Number.isInteger(ttl) ||
@@ -164,10 +272,15 @@ export async function createJob(
 
     const key = jobKey(jobId);
 
+    const stored = {
+        ...job,
+        version: Number.isInteger(job.version) ? job.version : 0
+    };
+
     try {
         const result = await client.set(
             key,
-            JSON.stringify(job),
+            JSON.stringify(stored),
             {
                 nx: true,
                 ex: ttl
@@ -233,13 +346,20 @@ export async function getJob(jobId) {
 }
 
 /**
- * Atomisks updateJob ar optimistic concurrency
- * Idempotence: ja tas pats zipTxId/manifestTxId → OK
+ * Atomisks updateJob ar optimistisku concurrency kontroli.
+ *
+ * Ja padots lockToken, atjauninājums notiek tikai tad, ja Redis slēdzenē
+ * joprojām ir tas pats token. Tas novērš stāvokļa pārrakstīšanu pēc
+ * slēdzenes zaudēšanas.
+ *
+ * Ja lockToken nav padots, atjauninājums joprojām ir atomisks (pārbauda
+ * versiju), bet ne pārbauda slēdzeni.
  */
 export async function updateJob(
     jobId,
     patch,
-    ttlSeconds = DEFAULT_JOB_TTL
+    ttlSeconds = null,
+    options = {}
 ) {
     const client = requireRedis();
 
@@ -253,16 +373,10 @@ export async function updateJob(
         );
     }
 
-    const ttl = Number(ttlSeconds);
-
-    if (
-        !Number.isInteger(ttl) ||
-        ttl <= 0
-    ) {
-        throw new Error(
-            'Nederīgs job TTL.'
-        );
-    }
+    const lockToken =
+        typeof options?.lockToken === 'string' && options.lockToken.length > 0
+            ? options.lockToken
+            : null;
 
     const maxRetries = 3;
     let lastError = null;
@@ -278,7 +392,6 @@ export async function updateJob(
             }
 
             if (patch.status && patch.status !== current.status) {
-                // ✅ Failed ierobežojums
                 if (
                     patch.status === 'failed' &&
                     current.status === 'blockchain-finalizing' &&
@@ -288,37 +401,84 @@ export async function updateJob(
                         'Blockchain transaction exists — recovery required, not failed.'
                     );
                 }
-                
+
                 validateStateTransition(current.status, patch.status);
             }
+
+            const currentVersion = Number.isInteger(current.version)
+                ? current.version
+                : 0;
 
             const next = {
                 ...current,
                 ...patch,
+                version: currentVersion + 1,
                 updatedAt: Date.now()
             };
 
-            await client.set(
-                jobKey(jobId),
-                JSON.stringify(next),
-                {
-                    ex: ttl
-                }
+            const ttl = Number(
+                ttlSeconds !== null && ttlSeconds !== undefined
+                    ? ttlSeconds
+                    : resolveJobTtl(next)
             );
 
-            return next;
+            if (ttl < 0) {
+                throw new Error('Nederīgs job TTL.');
+            }
+
+            const nextJson = JSON.stringify(next);
+
+            let result;
+            if (lockToken) {
+                result = await client.eval(
+                    UPDATE_JOB_LOCKED_LUA,
+                    [jobKey(jobId), jobLockKey(jobId)],
+                    [String(currentVersion), nextJson, String(ttl), lockToken]
+                );
+            } else {
+                result = await client.eval(
+                    UPDATE_JOB_LUA,
+                    [jobKey(jobId)],
+                    [String(currentVersion), nextJson, String(ttl)]
+                );
+            }
+
+            if (result === 1) {
+                return next;
+            }
+
+            if (result === -1) {
+                throw new Error('Backup job nav atrasts.');
+            }
+
+            if (result === -3) {
+                throw new Error('Job slēdzene vairs nepieder mums.');
+            }
+
+            if (result === 0) {
+                // Versija mainījusies starp nolasīšanu un rakstīšanu.
+                if (attempt < maxRetries - 1) {
+                    await new Promise(resolve => setTimeout(resolve, 50));
+                    continue;
+                }
+                throw new Error('Job versija mainījās — atjauninājums neizdevās.');
+            }
+
+            throw new Error('Neizdevās atjaunināt job stāvokli.');
         } catch (error) {
             lastError = error;
-            
+
             if (
                 error.message &&
                 (error.message.includes('Nederīga state pāreja') ||
                  error.message.includes('Backup job nav atrasts') ||
-                 error.message.includes('recovery required'))
+                 error.message.includes('recovery required') ||
+                 error.message.includes('vairs nepieder mums') ||
+                 error.message.includes('Nederīgs job TTL'))
             ) {
                 throw error;
             }
-            
+
             if (attempt < maxRetries - 1) {
                 await new Promise(resolve => setTimeout(resolve, 50));
             }
@@ -492,5 +652,8 @@ export {
     VALID_JOB_STATUSES,
     VALID_TRANSITIONS,
     DEFAULT_JOB_TTL,
+    COMPLETED_JOB_TTL,
+    FAILED_JOB_TTL,
+    ACTIVE_JOB_TTL,
     JOB_LOCK_TTL
 };

@@ -105,6 +105,7 @@ function BackupPage() {
     const [fileInfo, setFileInfo] = useState({ count: 0, sizeText: '', loading: true });
     const [changedFilesForUpload, setChangedFilesForUpload] = useState([]);
     const [unchangedFilesForUpload, setUnchangedFilesForUpload] = useState(Object.create(null));
+    const [deletedFilesForUpload, setDeletedFilesForUpload] = useState([]);
     const [preparedJobId, setPreparedJobId] = useState(null);
     const [recoveredJobData, setRecoveredJobData] = useState(null);
 
@@ -593,6 +594,9 @@ function BackupPage() {
                                         Object.assign(Object.create(null), jobStatus.unchangedFiles)
                                     );
                                 }
+                                if (Array.isArray(jobStatus.deletedFiles)) {
+                                    setDeletedFilesForUpload(jobStatus.deletedFiles);
+                                }
 
                                 uploadedZipRef.current = {
                                     txId: jobStatus.zipTxId,
@@ -915,6 +919,10 @@ function BackupPage() {
                         }
                     }
 
+                    // ✅ B03: Aprēķina deletedFiles (bija iepriekšējā manifestā, bet vairs nav)
+                    const currentPaths = new Set(files.map(f => f.path));
+                    const deletedFiles = Object.keys(previousPaths).filter(path => !currentPaths.has(path));
+
                     setCurrentPreviousBackupNumber(Number(metadata.backupCount || 0));
                     setFileInfo({
                         count: changedFiles.length,
@@ -923,6 +931,7 @@ function BackupPage() {
                     });
                     setChangedFilesForUpload(changedFiles);
                     setUnchangedFilesForUpload(unchangedFiles);
+                    setDeletedFilesForUpload(deletedFiles);
                     
                     setStatus('');
                     setLastStatusData(null);
@@ -977,7 +986,7 @@ function BackupPage() {
             return;
         }
         
-        if (changedFilesForUpload.length === 0 && !recoveredJobData) {
+        if (changedFilesForUpload.length === 0 && deletedFilesForUpload.length === 0 && !recoveredJobData) {
             setStatus(t('no-changes'));
             setLastStatusData({ type: 'simple', key: 'no-changes' });
             return;
@@ -1072,6 +1081,7 @@ function BackupPage() {
                 preparedJobId,
                 changedFilesForUpload,
                 unchangedFilesForUpload,
+                deletedFilesForUpload,
                 keyHex,
                 client,
                 signerInstance
@@ -1087,7 +1097,7 @@ function BackupPage() {
         }
     }, [
         config, userAddress, nftInfo.backupCount, repoName, t,
-        changedFilesForUpload, unchangedFilesForUpload, preparedJobId,
+        changedFilesForUpload, unchangedFilesForUpload, deletedFilesForUpload, preparedJobId,
         showMasterKey, promptMasterKey, isValidMasterKey, recoveredJobData,
         createMasterKeyVerifier
     ]);
@@ -1096,6 +1106,7 @@ function BackupPage() {
         jobId,
         changedFiles,
         unchangedFiles,
+        deletedFiles,
         keyHex,
         client,
         signerInstance
@@ -1317,6 +1328,12 @@ function BackupPage() {
 
                 const masterKeyVerifier = await createMasterKeyVerifier(keyHex);
 
+                // ✅ B03 + R01: archive.contains (tikai changed faili), merkleRoot, deletedFiles
+                const archiveContains = changedFiles.map(file => ({
+                    path: file.path,
+                    hash: file.hash
+                }));
+
                 manifest = {
                     manifest: 'arweave/paths',
                     version: '0.2.0',
@@ -1330,12 +1347,11 @@ function BackupPage() {
                     archive: {
                         id: zipTxId,
                         url: `/raw/${encodeURIComponent(zipTxId)}`,
-                        contains: changedFiles.map(file => ({
-                            path: file.path,
-                            hash: file.hash
-                        }))
+                        contains: archiveContains
                     },
+                    merkleRoot: merkleRoot,
                     paths: Object.create(null),
+                    deletedFiles: deletedFiles,
                     history
                 };
 

@@ -40,10 +40,26 @@ function loadRestoreTranslations() {
   }
 }
 
+// ✅ P01 labojums: ierobežo kļūdas izvadu, lai Action logā neiekļautu visu failu.
 test('P01 — galvenie backup JavaScript moduļi iziet Node sintakses pārbaudi', () => {
   for (const file of ['server.js', 'accounting-redis.js']) {
-    const result = spawnSync(process.execPath, ['--check', path.join(root, file)], { encoding: 'utf8' });
-    assert.equal(result.status, 0, `${file}: ${result.stderr || result.stdout}`);
+    const result = spawnSync(
+      process.execPath,
+      ['--check', path.join(root, file)],
+      { encoding: 'utf8', timeout: 10000, killSignal: 'SIGKILL' }
+    );
+
+    if (result.error) {
+      assert.fail(`${file}: neizdevās palaist node --check (${result.error.message})`);
+    }
+
+    if (result.status !== 0) {
+      // ✅ Ierobežojam izvadu līdz 300 simboliem — NEVIS viss fails
+      const raw = (result.stderr || result.stdout || '').trim();
+      const firstLine = raw.split('\n')[0] || 'nezināma kļūda';
+      const snippet = firstLine.slice(0, 300);
+      assert.fail(`${file}: sintakses kļūda — ${snippet}`);
+    }
   }
 });
 

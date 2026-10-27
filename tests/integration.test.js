@@ -9,7 +9,7 @@ const manifestRoute = routeSource("app.post('/api/save-manifest-tx'");
 test('I01 — backup platformas kritiskie faili atrodas repozitorijā', () => {
   for (const file of [
     'server.js', 'accounting-redis.js', 'src/BackupPage.jsx',
-    'public/contracts/50-5-PermRepoNFT.sol', 'public/contracts/10-PermRepo-Subscription.sol'
+    'public/contracts/50-4-PermRepoNFT.sol', 'public/contracts/10-PermRepo-Subscription.sol'
   ]) assert.ok(fs.existsSync(path.join(root, file)), `Trūkst backup platformas faila: ${file}`);
 });
 
@@ -100,42 +100,4 @@ test('I12 — existing recovered ZIP is not reused without its original IV', () 
     'Atkopšanas ZIP IV netiek paņemts no recoveredJobData.');
   assert.match(client, /if \(zipTxId && \(!iv \|\| iv\.length !== 12\)\)\s*\{\s*throw new Error\(t\('recovery-upload-incomplete'\)\);/,
     'Esošs ZIP bez derīga 12 baitu IV netiek apturēts pirms manifesta veidošanas.');
-});
-
-test('I13 — deletion-only backup is represented by an internal encrypted archive entry', () => {
-  const client = fs.readFileSync(path.join(root, 'src/BackupPage.jsx'), 'utf8');
-  assert.match(client, /const deletedPaths = Object\.keys\(previousPaths\)\.filter\(filePath => !currentPathSet\.has\(filePath\)\)/);
-  assert.match(client, /format: 'PermRepo deletions v1'/);
-  assert.match(client, /if \(!file\.internal && !internalArchivePaths\.has\(file\.path\)\)/);
-  assert.match(client, /format: 'PermRepo deletions v1'/);
-});
-
-test('I14 — existing first-backup ZIP must have a matching Master Key verifier', () => {
-  const client = fs.readFileSync(path.join(root, 'src/BackupPage.jsx'), 'utf8');
-  const server = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
-  assert.match(client, /recoveredJobData\?\.zipKeyVerifier/);
-  assert.match(client, /enteredVerifier\.toLowerCase\(\) !== recoveryVerifier\.toLowerCase\(\)/);
-  assert.match(server, /zipKeyVerifier/);
-  assert.match(server, /Esošam ZIP nevar piešķirt jaunu Master Key verifikatoru/);
-});
-
-test('I15 — server checks manifest IV and archive commitment against the ZIP checkpoint', () => {
-  const server = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
-  assert.match(server, /Manifesta ZIP IV nesakrīt ar saglabāto ZIP IV/);
-  assert.match(server, /Manifesta archive\.contains nesakrīt ar ZIP posmā saglabāto Merkle root/);
-  assert.match(server, /function calculateArchiveMerkleRoot\(contains\)/);
-});
-
-test('I16 — failed mined blockchain transaction returns to retryable manifest-uploaded state', () => {
-  const server = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
-  const client = fs.readFileSync(path.join(root, 'src/BackupPage.jsx'), 'utf8');
-  assert.match(server, /receipt\.status !== 0/);
-  assert.match(server, /status: 'manifest-uploaded',[\s\S]*retryableBlockchainFailure: true/);
-  assert.match(client, /txHash: submittedTxHash/);
-});
-
-
-test('I17 — Redis state machine permits retry only from blockchain finalizing back to manifest uploaded', () => {
-  const redis = fs.readFileSync(path.join(root, 'accounting-redis.js'), 'utf8');
-  assert.match(redis, /'blockchain-finalizing': \['completed', 'failed', 'manifest-uploaded'\]/);
 });

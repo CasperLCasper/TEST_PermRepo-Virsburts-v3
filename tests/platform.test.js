@@ -20,12 +20,9 @@ function loadRestoreTranslations() {
   if (!exists(RESTORE_TRANSLATIONS_PATH)) return null;
   try {
     const source = read(RESTORE_TRANSLATIONS_PATH);
-    // Izvelkam `export const translations = { ... };` saturu un parsējam kā JSON,
-    // lai izvairītos no dinamiskas importa atkarības.
     const start = source.indexOf('export const translations = {');
     if (start < 0) return null;
     const jsonStart = source.indexOf('{', start);
-    // Atrodam atbilstošo noslēdzošo bikšu pāri
     let depth = 0;
     let end = -1;
     for (let i = jsonStart; i < source.length; i++) {
@@ -37,7 +34,6 @@ function loadRestoreTranslations() {
     }
     if (end < 0) return null;
     const objectLiteral = source.slice(jsonStart, end + 1);
-    // Droši parsējam tikai vienkāršu objektu ar string atslēgām.
     return new Function(`return (${objectLiteral});`)();
   } catch {
     return null;
@@ -60,7 +56,6 @@ test('P02 — katrai valodai ir vienāds tulkojumu atslēgu kopums', () => {
   }
 });
 
-// ✅ P02a/P02b — tikai ja restore faili ir repozitorijā
 test('P02a — restore platformas tulkojumu atslēgas sakrīt starp valodām', { skip: !exists(RESTORE_TRANSLATIONS_PATH) }, () => {
   const restoreTranslations = loadRestoreTranslations();
   assert.ok(restoreTranslations, 'Neizdevās ielādēt restore/translations.js.');
@@ -297,7 +292,6 @@ test('P21 — BackupPage sūta deletedFiles manifestā (B03)', () => {
     'deletedFiles netiek saglabāts state.');
 });
 
-// ✅ P22 — restore.js pārbaude tikai ja fails ir repozitorijā
 test('P22 — restore.js atbalsta deletedFiles (B03)', { skip: !hasRestoreFiles }, () => {
   const source = read(RESTORE_JS_PATH);
   assert.match(source, /manifest\.deletedFiles/,
@@ -317,7 +311,6 @@ test('P23 — BackupPage veido archive.contains un merkleRoot (R01)', () => {
   assert.match(page, /merkleRoot:\s*merkleRoot/, 'merkleRoot netiek iekļauts manifestā.');
 });
 
-// ✅ P24 — restore.js R01 pārbaude tikai ja fails ir repozitorijā
 test('P24 — restore.js prasa archive.contains un merkleRoot (R01)', { skip: !hasRestoreFiles }, () => {
   const source = read(RESTORE_JS_PATH);
   assert.match(source, /if \(!Array\.isArray\(manifest\.archive\.contains\) \|\| manifest\.archive\.contains\.length === 0\)/,

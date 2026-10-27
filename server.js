@@ -771,6 +771,15 @@ function getAllowedConnectOrigins() {
     return [...origins].join(' ');
 }
 
+// ✅ S01: lock zaudēšanas signalizācija
+function throwIfLockLost(signal) {
+    if (signal?.aborted) {
+        throw signal.reason instanceof Error
+            ? signal.reason
+            : new Error('Job slēdzene tika zaudēta — darbs pārtraukts.');
+    }
+}
+
 async function withJobLock(jobId, fn) {
     const token = await acquireJobLock(jobId);
 
@@ -778,16 +787,21 @@ async function withJobLock(jobId, fn) {
         throw new Error('Job jau tiek apstrādāts.');
     }
 
+    const lockLostController = new AbortController();
     let heartbeatActive = true;
+
     const heartbeat = setInterval(async () => {
         if (!heartbeatActive) return;
 
         try {
             const extended = await extendJobLock(jobId, token);
             if (!extended) {
-                console.warn(`⚠️ Lock ${jobId} vairs nepieder mums — heartbeat apturēts`);
+                console.warn(`⚠️ Lock ${jobId} vairs nepieder mums — heartbeat apturēts, darbs tiek pārtraukts`);
                 heartbeatActive = false;
                 clearInterval(heartbeat);
+                lockLostController.abort(
+                    new Error('Job slēdzene tika zaudēta — darbs pārtraukts.')
+                );
             }
         } catch (error) {
             console.error('Lock heartbeat kļūda:', error);
@@ -797,7 +811,10 @@ async function withJobLock(jobId, fn) {
     heartbeat.unref();
 
     try {
-        return await fn();
+        return await fn({
+            lockSignal: lockLostController.signal,
+            lockToken: token
+        });
     } finally {
         heartbeatActive = false;
         clearInterval(heartbeat);
@@ -1465,6 +1482,7 @@ function validateJobTxInput(jobId, txId) {
     }
 }
 
+// ✅ B03 + R01: Papildināta manifesta validācija
 function validateManifest(manifest) {
     if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
         throw new Error('Manifests nav derīgs objekts.');
@@ -1534,6 +1552,62 @@ function validateManifest(manifest) {
         manifest.archive.id !== undefined && !validateArweaveId(manifest.archive.id)) {
         throw new Error('Manifesta archive ID nav derīgs.');
     }
+
+    // ✅ R01: Jaunajiem manifestiem (encryption.version === 1) archive.contains un merkleRoot ir obligāti
+    if (encryption.version === 1) {
+        if (!manifest.archive || typeof manifest.archive !== 'object' || Array.isArray(manifest.archive)) {
+            throw new Error('Manifesta archive nav derīgs.');
+        }
+        if (!Array.isArray(manifest.archive.contains) || manifest.archive.contains.length === 0) {
+            throw new Error('Manifesta archive.contains nav derīgs vai ir tukšs.');
+        }
+        if (typeof manifest.merkleRoot !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(manifest.merkleRoot)) {
+            throw new Error('Manifesta merkleRoot nav derīgs.');
+        }
+
+        // Pārbauda, ka archive.contains atbilst paths (katram contains ierakstam jābūt paths ar tādu pašu hash)
+        const containsPaths = new Set();
+        for (const entry of manifest.archive.contains) {
+            if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
+                typeof entry.path !== 'string' ||
+                typeof entry.hash !== 'string' || !/^[0-9a-fA-F]{64}$/.test(entry.hash)) {
+                throw new Error('Manifesta archive.contains satur nederīgu ierakstu.');
+            }
+            if (entry.path.length < 1 || entry.path.length > 1000 ||
+                entry.path.startsWith('/') || entry.path.startsWith('\\') || /^[a-zA-Z]:/.test(entry.path) ||
+                entry.path.includes('\\') || entry.path.split('/').some(part => part === '..' || part === '.') ||
+                /[\x00-\x1f]/.test(entry.path)) {
+                throw new Error('Manifesta archive.contains satur nederīgu ceļu.');
+            }
+            if (containsPaths.has(entry.path)) {
+                throw new Error(`Manifesta archive.contains satur dublētu ceļu: ${entry.path}`);
+            }
+            containsPaths.add(entry.path);
+            const pathInfo = manifest.paths[entry.path];
+            if (!pathInfo || pathInfo.hash.toLowerCase() !== entry.hash.toLowerCase()) {
+                throw new Error(`Manifesta archive.contains hash nesakrīt ar paths: ${entry.path}`);
+            }
+        }
+    }
+
+    // ✅ B03: deletedFiles validācija
+    if (manifest.deletedFiles !== undefined) {
+        if (!Array.isArray(manifest.deletedFiles)) {
+            throw new Error('Manifesta deletedFiles nav masīvs.');
+        }
+        for (const filePath of manifest.deletedFiles) {
+            if (typeof filePath !== 'string' || filePath.length < 1 || filePath.length > 1000 ||
+                filePath.startsWith('/') || filePath.startsWith('\\') || /^[a-zA-Z]:/.test(filePath) ||
+                filePath.includes('\\') || filePath.split('/').some(part => part === '..' || part === '.') ||
+                /[\x00-\x1f]/.test(filePath)) {
+                throw new Error('Manifesta deletedFiles satur nederīgu ceļu.');
+            }
+            if (manifest.paths && Object.prototype.hasOwnProperty.call(manifest.paths, filePath)) {
+                throw new Error(`Fails ${filePath} nevar būt gan paths, gan deletedFiles.`);
+            }
+        }
+    }
+
     return true;
 }
 
@@ -2108,9 +2182,9 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
             maxFileBytes = Math.max(maxFileBytes, blob.size);
         }
 
-        // ✅ #1 LABOJUMS: Serveris ielādē iepriekšējo manifestu un sadala changed/unchanged
+        // ✅ Serveris ielādē iepriekšējo manifestu un sadala changed/unchanged
         const previousManifest = await loadPreviousManifest(lastManifest);
-        // ✅ #4 LABOJUMS: Object.create(null) pret __proto__ robustness
+        // ✅ Object.create(null) pret __proto__ robustness
         const previousPaths =
             previousManifest &&
             previousManifest.paths &&
@@ -2195,7 +2269,7 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
 
         const jobFiles = [];
         const changedFileMetadata = [];
-        // ✅ #4 LABOJUMS: Object.create(null) pret __proto__ robustness
+        // ✅ Object.create(null) pret __proto__ robustness
         const unchangedFiles = Object.create(null);
         let totalBytes = 0;
 
@@ -2222,7 +2296,7 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
                 size: file.size
             });
 
-            // ✅ #1 LABOJUMS: Sadala changed/unchanged servera pusē
+            // ✅ Sadala changed/unchanged servera pusē
             const previousFile = previousPaths[file.path];
 
             if (
@@ -2250,8 +2324,13 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
             });
         });
 
+        // ✅ B03: Aprēķina deletedFiles (bija iepriekšējā manifestā, bet vairs nav)
+        const currentPaths = new Set(jobFiles.map(f => f.path));
+        const deletedFiles = Object.keys(previousPaths).filter(
+            path => !currentPaths.has(path)
+        );
+
         // ✅ Job satur TIKAI metadata (bez base64 satura)
-        // ✅ #1 LABOJUMS: changedFileMetadata satur TIKAI changed failus
         const job = {
             version: 7,
             jobId,
@@ -2272,6 +2351,8 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
             // ✅ TIKAI changed failu metadata
             changedFileMetadata,
             unchangedFiles,
+            // ✅ B03: dzēstie faili
+            deletedFiles,
             status: 'prepared',
             cryptoVersion: 1,
             zipTxId: null,
@@ -2308,6 +2389,7 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
             fileCount: jobFiles.length,
             changedFileCount: changedFileMetadata.length,
             unchangedFileCount: Object.keys(unchangedFiles).length,
+            deletedFileCount: deletedFiles.length,
             totalBytes
         });
 
@@ -2449,6 +2531,7 @@ app.get('/api/job-status', async (req, res) => {
             completionTxHash: job.completionTxHash || null,
             changedFileMetadata: job.changedFileMetadata || [],
             unchangedFiles: job.unchangedFiles || {},
+            deletedFiles: job.deletedFiles || [],
             error: job.error || null,
             failedAt: job.failedAt || null
         });
@@ -2481,16 +2564,23 @@ app.post('/api/start-zip-upload', backupLimiter, async (req, res) => {
             });
         }
 
-        return await withJobLock(jobId, async () => {
+        return await withJobLock(jobId, async ({ lockSignal }) => {
+            throwIfLockLost(lockSignal);
+
             const job = await getJob(jobId);
+            throwIfLockLost(lockSignal);
+
             const wallet = await verifyJobAuthorization(req, job);
+            throwIfLockLost(lockSignal);
 
             await verifyJobNFTAuthorization({
                 ...job,
                 walletAddress: wallet
             });
+            throwIfLockLost(lockSignal);
 
             if (job.status === 'prepared') {
+                throwIfLockLost(lockSignal);
                 await updateJob(jobId, {
                     status: 'zip-uploading',
                     zipUploadStartedAt: Date.now(),
@@ -2530,8 +2620,7 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
             });
         }
 
-        // ✅ #2 LABOJUMS: Stingrāka IV validācija
-        // IV validācija (ja padots)
+        // ✅ Stingrāka IV validācija
         let normalizedIV = null;
         if (iv !== undefined && iv !== null) {
             if (!Array.isArray(iv) || iv.length !== 12) {
@@ -2541,7 +2630,6 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
                 });
             }
 
-            // ✅ Stingrāka validācija: katram elementam jābūt integer 0-255
             for (const b of iv) {
                 if (!Number.isInteger(b) || b < 0 || b > 255) {
                     return res.status(400).json({
@@ -2569,14 +2657,20 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
             normalizedMerkleRoot = merkleRoot;
         }
 
-        return await withJobLock(jobId, async () => {
+        return await withJobLock(jobId, async ({ lockSignal, lockToken }) => {
+            throwIfLockLost(lockSignal);
+
             const job = await getJob(jobId);
+            throwIfLockLost(lockSignal);
+
             const wallet = await verifyJobAuthorization(req, job);
+            throwIfLockLost(lockSignal);
 
             await verifyJobNFTAuthorization({
                 ...job,
                 walletAddress: wallet
             });
+            throwIfLockLost(lockSignal);
 
             // ✅ Idempotence
             if (
@@ -2601,8 +2695,9 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
                     if (!job.zipIv && normalizedIV) missingZipMetadata.zipIv = normalizedIV;
                     if (!job.zipMerkleRoot && normalizedMerkleRoot) missingZipMetadata.zipMerkleRoot = normalizedMerkleRoot;
                     if (Object.keys(missingZipMetadata).length) {
+                        throwIfLockLost(lockSignal);
                         missingZipMetadata.updatedAt = Date.now();
-                        await updateJob(jobId, missingZipMetadata, JOB_TTL_SECONDS);
+                        await updateJob(jobId, missingZipMetadata, JOB_TTL_SECONDS, { lockToken });
                     }
                     return res.json({ success: true, idempotent: true, status: job.status });
                 }
@@ -2623,6 +2718,8 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
                     : job.manifestUploadStartedAt
                         ? 'manifest-uploading'
                         : 'zip-uploaded';
+
+                throwIfLockLost(lockSignal);
                 await updateJob(jobId, {
                     zipTxId,
                     cryptoVersion: 1,
@@ -2635,7 +2732,7 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
                     recoveredAt: Date.now(),
                     zipUploadedAt: job.zipUploadedAt || Date.now(),
                     updatedAt: Date.now()
-                }, JOB_TTL_SECONDS);
+                }, JOB_TTL_SECONDS, { lockToken });
 
                 logSection('🔄 RECOVERED FROM FAILED (ZIP)');
                 logInfo('Job ID', jobId);
@@ -2654,6 +2751,7 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
                 );
             }
 
+            throwIfLockLost(lockSignal);
             await updateJob(jobId, {
                 zipTxId,
                 cryptoVersion: 1,
@@ -2662,7 +2760,7 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
                 status: 'zip-uploaded',
                 zipUploadedAt: Date.now(),
                 updatedAt: Date.now()
-            }, JOB_TTL_SECONDS);
+            }, JOB_TTL_SECONDS, { lockToken });
 
             return res.json({
                 success: true,
@@ -2698,16 +2796,23 @@ app.post('/api/start-manifest-upload', backupLimiter, async (req, res) => {
             });
         }
 
-        return await withJobLock(jobId, async () => {
+        return await withJobLock(jobId, async ({ lockSignal }) => {
+            throwIfLockLost(lockSignal);
+
             const job = await getJob(jobId);
+            throwIfLockLost(lockSignal);
+
             const wallet = await verifyJobAuthorization(req, job);
+            throwIfLockLost(lockSignal);
 
             await verifyJobNFTAuthorization({
                 ...job,
                 walletAddress: wallet
             });
+            throwIfLockLost(lockSignal);
 
             if (job.status === 'zip-uploaded') {
+                throwIfLockLost(lockSignal);
                 await updateJob(jobId, {
                     status: 'manifest-uploading',
                     manifestUploadStartedAt: Date.now(),
@@ -2742,16 +2847,22 @@ app.post('/api/save-manifest-tx', backupLimiter, async (req, res) => {
         validateJobTxInput(jobId, manifestTxId);
         validateManifest(manifest);
 
-        return await withJobLock(jobId, async () => {
+        return await withJobLock(jobId, async ({ lockSignal, lockToken }) => {
+            throwIfLockLost(lockSignal);
+
             const job = await getJob(jobId);
+            throwIfLockLost(lockSignal);
+
             const wallet = await verifyJobAuthorization(req, job);
+            throwIfLockLost(lockSignal);
 
             await verifyJobNFTAuthorization({
                 ...job,
                 walletAddress: wallet
             });
+            throwIfLockLost(lockSignal);
 
-            // B06: piesaista manifestu tieši GitHub repozitorijam,
+            // ✅ B06: piesaista manifestu tieši GitHub repozitorijam,
             // kuram šis backup job tika izveidots.
             const manifestRepositoryId = String(manifest.metadata.repositoryId);
             const jobRepositoryId = String(job.githubRepositoryId ?? '');
@@ -2787,9 +2898,7 @@ app.post('/api/save-manifest-tx', backupLimiter, async (req, res) => {
                 );
             }
 
-            // ✅ #2 LABOJUMS: Recovery no failed → manifest-uploaded
-            // Ja manifests jau ir saglabāts, bet statuss ir failed
-            // Atjaunot statusu uz manifest-uploaded, lai varētu turpināt
+            // ✅ Recovery no failed → manifest-uploaded
             if (
                 job.status === 'failed' &&
                 job.manifestUploadStartedAt &&
@@ -2799,6 +2908,7 @@ app.post('/api/save-manifest-tx', backupLimiter, async (req, res) => {
                     throw new Error('Manifesta archive ID nesakrīt ar ZIP transakciju.');
                 }
 
+                throwIfLockLost(lockSignal);
                 await updateJob(jobId, {
                     manifestTxId,
                     manifest,
@@ -2809,7 +2919,7 @@ app.post('/api/save-manifest-tx', backupLimiter, async (req, res) => {
                     recoveredAt: Date.now(),
                     manifestUploadedAt: Date.now(),
                     updatedAt: Date.now()
-                }, JOB_TTL_SECONDS);
+                }, JOB_TTL_SECONDS, { lockToken });
 
                 logSection('🔄 RECOVERED FROM FAILED (MANIFEST)');
                 logInfo('Job ID', jobId);
@@ -2834,13 +2944,14 @@ app.post('/api/save-manifest-tx', backupLimiter, async (req, res) => {
                 );
             }
 
+            throwIfLockLost(lockSignal);
             await updateJob(jobId, {
                 manifestTxId,
                 manifest,
                 status: 'manifest-uploaded',
                 manifestUploadedAt: Date.now(),
                 updatedAt: Date.now()
-            }, JOB_TTL_SECONDS);
+            }, JOB_TTL_SECONDS, { lockToken });
 
             return res.json({
                 success: true,
@@ -2933,14 +3044,20 @@ app.post('/api/start-blockchain-finalize', backupLimiter, async (req, res) => {
             });
         }
 
-        return await withJobLock(jobId, async () => {
+        return await withJobLock(jobId, async ({ lockSignal, lockToken }) => {
+            throwIfLockLost(lockSignal);
+
             const job = await getJob(jobId);
+            throwIfLockLost(lockSignal);
+
             const wallet = await verifyJobAuthorization(req, job);
+            throwIfLockLost(lockSignal);
 
             await verifyJobNFTAuthorization({
                 ...job,
                 walletAddress: wallet
             });
+            throwIfLockLost(lockSignal);
 
             if (typeof job.zipMerkleRoot !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(job.zipMerkleRoot)) {
                 throw new Error('Nederīgs vai trūkstošs ZIP posmā saglabātais Merkle root.');
@@ -2983,6 +3100,7 @@ app.post('/api/start-blockchain-finalize', backupLimiter, async (req, res) => {
             const onChainBackupCount = await nftContract.getBackupCount(
                 BigInt(job.tokenId)
             );
+            throwIfLockLost(lockSignal);
 
             const expectedBackupNumber = (onChainBackupCount + 1n).toString();
 
@@ -2992,6 +3110,7 @@ app.post('/api/start-blockchain-finalize', backupLimiter, async (req, res) => {
                 );
             }
 
+            throwIfLockLost(lockSignal);
             await updateJob(jobId, {
                 status: 'blockchain-finalizing',
                 backupNumber: String(backupNumber),
@@ -3001,7 +3120,7 @@ app.post('/api/start-blockchain-finalize', backupLimiter, async (req, res) => {
                 deadline: String(deadline),
                 blockchainFinalizeStartedAt: Date.now(),
                 updatedAt: Date.now()
-            }, JOB_TTL_SECONDS);
+            }, JOB_TTL_SECONDS, { lockToken });
 
             return res.json({
                 success: true,
@@ -3040,14 +3159,20 @@ app.post('/api/save-backup-tx', backupLimiter, async (req, res) => {
             });
         }
 
-        return await withJobLock(jobId, async () => {
+        return await withJobLock(jobId, async ({ lockSignal, lockToken }) => {
+            throwIfLockLost(lockSignal);
+
             const job = await getJob(jobId);
+            throwIfLockLost(lockSignal);
+
             const wallet = await verifyJobAuthorization(req, job);
+            throwIfLockLost(lockSignal);
 
             await verifyJobNFTAuthorization({
                 ...job,
                 walletAddress: wallet
             });
+            throwIfLockLost(lockSignal);
 
             if (job.status !== 'blockchain-finalizing') {
                 throw new Error(
@@ -3069,11 +3194,12 @@ app.post('/api/save-backup-tx', backupLimiter, async (req, res) => {
                 );
             }
 
+            throwIfLockLost(lockSignal);
             await updateJob(jobId, {
                 backupTxHash: txHash,
                 backupTxSubmittedAt: Date.now(),
                 updatedAt: Date.now()
-            }, JOB_TTL_SECONDS);
+            }, JOB_TTL_SECONDS, { lockToken });
 
             return res.json({
                 success: true,
@@ -3112,14 +3238,20 @@ app.post('/api/complete-backup', backupLimiter, async (req, res) => {
             });
         }
 
-        return await withJobLock(jobId, async () => {
+        return await withJobLock(jobId, async ({ lockSignal, lockToken }) => {
+            throwIfLockLost(lockSignal);
+
             const job = await getJob(jobId);
+            throwIfLockLost(lockSignal);
+
             const wallet = await verifyJobAuthorization(req, job);
+            throwIfLockLost(lockSignal);
 
             await verifyJobNFTAuthorization({
                 ...job,
                 walletAddress: wallet
             });
+            throwIfLockLost(lockSignal);
 
             // ✅ Idempotence
             if (job.status === 'completed') {
@@ -3155,6 +3287,7 @@ app.post('/api/complete-backup', backupLimiter, async (req, res) => {
             } catch {
                 throw new Error('Neizdevās iegūt transakcijas receipt.');
             }
+            throwIfLockLost(lockSignal);
 
             if (!receipt) {
                 throw new Error('Transakcija vēl nav apstiprināta.');
@@ -3217,12 +3350,13 @@ app.post('/api/complete-backup', backupLimiter, async (req, res) => {
                 throw new Error('BackupAdded manifestURI nesakrīt.');
             }
 
+            throwIfLockLost(lockSignal);
             await updateJob(jobId, {
                 status: 'completed',
                 completionTxHash: txHash,
                 completedAt: Date.now(),
                 updatedAt: Date.now()
-            }, JOB_TTL_SECONDS);
+            }, JOB_TTL_SECONDS, { lockToken });
 
             logSection('✅ BACKUP COMPLETED');
             logInfo('Job ID', jobId);
@@ -3240,7 +3374,7 @@ app.post('/api/complete-backup', backupLimiter, async (req, res) => {
         });
     } catch (error) {
         const message = errorMessage(error);
-        const status = /nav atrasts|nav github|nesakrīt|nepieder|nederīgs|nav saglabāts|neizdevās|nav apstiprināta|nederīga state/i.test(message) ? 400 : 500;
+        const status = /nav atrasts|nav github|nesakrīt|nepieder|nederīgs|nav saglabāts|neizdevās|nav apstiprināta|nederīga state|slēdzene/i.test(message) ? 400 : 500;
 
         return res.status(status).json({
             success: false,
@@ -3267,10 +3401,14 @@ app.post('/api/fail-backup', backupLimiter, async (req, res) => {
             });
         }
 
-        return await withJobLock(jobId, async () => {
+        return await withJobLock(jobId, async ({ lockSignal, lockToken }) => {
+            throwIfLockLost(lockSignal);
+
             const job = await getJob(jobId);
+            throwIfLockLost(lockSignal);
 
             await verifyJobAuthorization(req, job);
+            throwIfLockLost(lockSignal);
 
             if (job.status === 'completed') {
                 return res.json({
@@ -3301,12 +3439,13 @@ app.post('/api/fail-backup', backupLimiter, async (req, res) => {
                 });
             }
 
+            throwIfLockLost(lockSignal);
             await updateJob(jobId, {
                 status: 'failed',
                 error: String(jobError || 'Unknown error').substring(0, 500),
                 failedAt: Date.now(),
                 updatedAt: Date.now()
-            }, JOB_TTL_SECONDS);
+            }, JOB_TTL_SECONDS, { lockToken });
 
             logSection('⚠️ BACKUP FAILED');
             logInfo('Job ID', jobId);

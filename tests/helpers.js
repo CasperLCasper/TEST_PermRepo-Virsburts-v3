@@ -35,37 +35,25 @@ export const ZIP_ID = 'B'.repeat(43);
 export const OTHER_ZIP_ID = 'C'.repeat(43);
 
 // ✅ R01: validManifest tagad satur archive.contains un merkleRoot
-export const validManifest = (overrides = {}) => {
-  const base = {
-    manifest: 'arweave/paths',
-    version: '0.2.0',
-    metadata: { repo: 'test/repo', repositoryId: 1421380729 },
-    encryption: {
-      algorithm: 'AES-GCM',
-      kdf: 'HKDF-SHA-256',
-      version: 1,
-      keyVerifier: `0x${'c'.repeat(64)}`,
-      ivs: { [ZIP_ID]: Array(12).fill(7) }
-    },
-    paths: { 'README.md': { zipId: ZIP_ID, hash: 'a'.repeat(64) } },
-    archive: {
-      id: ZIP_ID,
-      contains: [{ path: 'README.md', hash: 'a'.repeat(64) }]
-    },
-    merkleRoot: `0x${'d'.repeat(64)}`,
-    ...overrides
-  };
-  return base;
-};
-
-// ✅ Palīgs, kas aprēķina pareizo merkleRoot no archive.contains
-export function computeMerkleRoot(contains) {
-  // Testos izmantojam vienkāršu deterministisku atvasinājumu, kas atbilst
-  // restore.js calculateArchiveMerkleRoot loģikai (keccak256 no hash virknēm).
-  // Šeit nav pieejams ethers, tāpēc lietojam fiksētu vērtību testiem, kas
-  // pārbauda tikai struktūru. Funkcionālajos testos merkleRoot tiek dots.
-  return `0x${'d'.repeat(64)}`;
-}
+export const validManifest = (overrides = {}) => ({
+  manifest: 'arweave/paths',
+  version: '0.2.0',
+  metadata: { repo: 'test/repo', repositoryId: 1421380729 },
+  encryption: {
+    algorithm: 'AES-GCM',
+    kdf: 'HKDF-SHA-256',
+    version: 1,
+    keyVerifier: `0x${'c'.repeat(64)}`,
+    ivs: { [ZIP_ID]: Array(12).fill(7) }
+  },
+  paths: { 'README.md': { zipId: ZIP_ID, hash: 'a'.repeat(64) } },
+  archive: {
+    id: ZIP_ID,
+    contains: [{ path: 'README.md', hash: 'a'.repeat(64) }]
+  },
+  merkleRoot: `0x${'d'.repeat(64)}`,
+  ...overrides
+});
 
 export function makeBackupValidator(source = backupSource) {
   const fn = extractBetween(source, 'function validateManifest(manifest) {', '\nasync function verifyJobAuthorization');

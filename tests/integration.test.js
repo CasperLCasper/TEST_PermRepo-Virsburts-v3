@@ -101,9 +101,46 @@ test('I12 — existing recovered ZIP is not reused without its original IV', () 
     'Esošs ZIP bez derīga 12 baitu IV netiek apturēts pirms manifesta veidošanas.');
 });
 
+test('I13 — deletion-only backup is represented by an internal encrypted archive entry', () => {
+  const client = fs.readFileSync(path.join(root, 'src/BackupPage.jsx'), 'utf8');
+  assert.match(client, /const deletedPaths = Object\.keys\(previousPaths\)\.filter\(filePath => !currentPathSet\.has\(filePath\)\)/);
+  assert.match(client, /format: 'PermRepo deletions v1'/);
+  assert.match(client, /if \(!file\.internal && !internalArchivePaths\.has\(file\.path\)\)/);
+  assert.match(client, /format: 'PermRepo deletions v1'/);
+});
+
+test('I14 — existing first-backup ZIP must have a matching Master Key verifier', () => {
+  const client = fs.readFileSync(path.join(root, 'src/BackupPage.jsx'), 'utf8');
+  const server = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
+  assert.match(client, /recoveredJobData\?\.zipKeyVerifier/);
+  assert.match(client, /enteredVerifier\.toLowerCase\(\) !== recoveryVerifier\.toLowerCase\(\)/);
+  assert.match(server, /zipKeyVerifier/);
+  assert.match(server, /Esošam ZIP nevar piešķirt jaunu Master Key verifikatoru/);
+});
+
+test('I15 — server checks manifest IV and archive commitment against the ZIP checkpoint', () => {
+  const server = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
+  assert.match(server, /Manifesta ZIP IV nesakrīt ar saglabāto ZIP IV/);
+  assert.match(server, /Manifesta archive\.contains nesakrīt ar ZIP posmā saglabāto Merkle root/);
+  assert.match(server, /function calculateArchiveMerkleRoot\(contains\)/);
+});
+
+test('I16 — failed mined blockchain transaction returns to retryable manifest-uploaded state', () => {
+  const server = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
+  const client = fs.readFileSync(path.join(root, 'src/BackupPage.jsx'), 'utf8');
+  assert.match(server, /receipt\.status !== 0/);
+  assert.match(server, /status: 'manifest-uploaded',[\s\S]*retryableBlockchainFailure: true/);
+  assert.match(client, /txHash: submittedTxHash/);
+});
+
+test('I17 — Redis state machine permits retry only from blockchain finalizing back to manifest uploaded', () => {
+  const redis = fs.readFileSync(path.join(root, 'accounting-redis.js'), 'utf8');
+  assert.match(redis, /'blockchain-finalizing': \['completed', 'failed', 'manifest-uploaded'\]/);
+});
+
 // ✅ S01: Lock zaudēšanas testi
 
-test('I13 — withJobLock nodod lockSignal un lockToken (S01)', () => {
+test('I18 — withJobLock nodod lockSignal un lockToken (S01)', () => {
   const start = backupSource.indexOf('async function withJobLock(jobId, fn) {');
   const end = backupSource.indexOf('\n// -----------------------------------------------------------------------------\n// Redis-backed express-session store.', start);
   assert.ok(start >= 0 && end > start, 'Nav atrasta withJobLock funkcija.');
@@ -113,7 +150,7 @@ test('I13 — withJobLock nodod lockSignal un lockToken (S01)', () => {
   assert.match(lockFn, /lockToken:\s*token/, 'fn() nesaņem lockToken.');
 });
 
-test('I14 — throwIfLockLost pārtrauc darbu pēc lock zaudēšanas (S01)', () => {
+test('I19 — throwIfLockLost pārtrauc darbu pēc lock zaudēšanas (S01)', () => {
   assert.match(backupSource, /function throwIfLockLost\(signal\)\s*\{/,
     'Nav atrasta throwIfLockLost funkcija.');
   const start = backupSource.indexOf('function throwIfLockLost(signal)');
@@ -123,19 +160,19 @@ test('I14 — throwIfLockLost pārtrauc darbu pēc lock zaudēšanas (S01)', () 
   assert.match(fn, /throw/, 'throwIfLockLost nemet kļūdu.');
 });
 
-test('I15 — visi withJobLock izsaucēji izmanto lockSignal (S01)', () => {
+test('I20 — visi withJobLock izsaucēji izmanto lockSignal (S01)', () => {
   const lockUsages = backupSource.match(/withJobLock\(jobId,\s*async\s*\(\{\s*lockSignal[^)]*\)/g) || [];
   assert.ok(lockUsages.length >= 6, `Sagaidīti vismaz 6 withJobLock izsaucēji ar lockSignal, atrasti ${lockUsages.length}.`);
 });
 
-test('I16 — visi updateJob izsaucēji withJobLock iekšienē saņem lockToken (S01)', () => {
+test('I21 — visi updateJob izsaucēji withJobLock iekšienē saņem lockToken (S01)', () => {
   const updateWithLock = backupSource.match(/updateJob\(jobId,\s*\{[^}]*\},\s*JOB_TTL_SECONDS,\s*\{\s*lockToken\s*\}\)/g) || [];
   assert.ok(updateWithLock.length >= 5, `Sagaidīti vismaz 5 updateJob izsaucēji ar lockToken, atrasti ${updateWithLock.length}.`);
 });
 
 // ✅ B03: deletedFiles testi servera pusē
 
-test('I17 — prepare-backup aprēķina deletedFiles (B03)', () => {
+test('I22 — prepare-backup aprēķina deletedFiles (B03)', () => {
   assert.match(backupSource, /const currentPaths = new Set\(jobFiles\.map\(f => f\.path\)\)/,
     'Nav atrasts currentPaths aprēķins.');
   assert.match(backupSource, /const deletedFiles = Object\.keys\(previousPaths\)\.filter/,
@@ -144,14 +181,14 @@ test('I17 — prepare-backup aprēķina deletedFiles (B03)', () => {
     'deletedFiles netiek saglabāts job objektā.');
 });
 
-test('I18 — job-status atgriež deletedFiles (B03)', () => {
+test('I23 — job-status atgriež deletedFiles (B03)', () => {
   assert.match(backupSource, /deletedFiles:\s*job\.deletedFiles\s*\|\|\s*\[\]/,
     'job-status neatgriež deletedFiles.');
 });
 
 // ✅ R01: validateManifest prasa archive.contains un merkleRoot
 
-test('I19 — validateManifest prasa archive.contains un merkleRoot (R01)', () => {
+test('I24 — validateManifest prasa archive.contains un merkleRoot (R01)', () => {
   const start = backupSource.indexOf('function validateManifest(manifest) {');
   const end = backupSource.indexOf('\nasync function verifyJobAuthorization', start);
   const fn = backupSource.slice(start, end);
@@ -160,7 +197,7 @@ test('I19 — validateManifest prasa archive.contains un merkleRoot (R01)', () =
   assert.match(fn, /if \(encryption\.version === 1\)/, 'validateManifest nepārbauda encryption.version.');
 });
 
-test('I20 — validateManifest pārbauda archive.contains atbilstību paths (R01)', () => {
+test('I25 — validateManifest pārbauda archive.contains atbilstību paths (R01)', () => {
   const start = backupSource.indexOf('function validateManifest(manifest) {');
   const end = backupSource.indexOf('\nasync function verifyJobAuthorization', start);
   const fn = backupSource.slice(start, end);

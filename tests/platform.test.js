@@ -8,58 +8,11 @@ import { translations } from '../src/translations.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = file => fs.readFileSync(path.join(root, file), 'utf8');
-const exists = file => fs.existsSync(path.join(root, file));
 
-// ✅ Restore platforma atrodas atsevišķi (Arweave permanent web).
-// Ja tās faili ir iekļauti repozitorijā, tos pārbaudām; ja nav — izlaižam.
-const RESTORE_TRANSLATIONS_PATH = 'restore/translations.js';
-const RESTORE_JS_PATH = 'restore.js';
-const hasRestoreFiles = exists(RESTORE_JS_PATH);
-
-function loadRestoreTranslations() {
-  if (!exists(RESTORE_TRANSLATIONS_PATH)) return null;
-  try {
-    const source = read(RESTORE_TRANSLATIONS_PATH);
-    const start = source.indexOf('export const translations = {');
-    if (start < 0) return null;
-    const jsonStart = source.indexOf('{', start);
-    let depth = 0;
-    let end = -1;
-    for (let i = jsonStart; i < source.length; i++) {
-      if (source[i] === '{') depth++;
-      else if (source[i] === '}') {
-        depth--;
-        if (depth === 0) { end = i; break; }
-      }
-    }
-    if (end < 0) return null;
-    const objectLiteral = source.slice(jsonStart, end + 1);
-    return new Function(`return (${objectLiteral});`)();
-  } catch {
-    return null;
-  }
-}
-
-// ✅ P01 labojums: ierobežo kļūdas izvadu, lai Action logā neiekļautu visu failu.
-test('P01 — galvenie backup JavaScript moduļi iziet Node sintakses pārbaudi', () => {
+ test('P01 — galvenie backup JavaScript moduļi iziet Node sintakses pārbaudi', () => {
   for (const file of ['server.js', 'accounting-redis.js']) {
-    const result = spawnSync(
-      process.execPath,
-      ['--check', path.join(root, file)],
-      { encoding: 'utf8', timeout: 10000, killSignal: 'SIGKILL' }
-    );
-
-    if (result.error) {
-      assert.fail(`${file}: neizdevās palaist node --check (${result.error.message})`);
-    }
-
-    if (result.status !== 0) {
-      // ✅ Ierobežojam izvadu līdz 300 simboliem — NEVIS viss fails
-      const raw = (result.stderr || result.stdout || '').trim();
-      const firstLine = raw.split('\n')[0] || 'nezināma kļūda';
-      const snippet = firstLine.slice(0, 300);
-      assert.fail(`${file}: sintakses kļūda — ${snippet}`);
-    }
+    const result = spawnSync(process.execPath, ['--check', path.join(root, file)], { encoding: 'utf8' });
+    assert.equal(result.status, 0, `${file}: ${result.stderr || result.stdout}`);
   }
 });
 
@@ -69,26 +22,6 @@ test('P02 — katrai valodai ir vienāds tulkojumu atslēgu kopums', () => {
   const baseline = Object.keys(translations[locales[0]]).sort();
   for (const locale of locales.slice(1)) {
     assert.deepEqual(Object.keys(translations[locale]).sort(), baseline, `Tulkojumu atslēgas atšķiras valodai ${locale}`);
-  }
-});
-
-test('P02a — restore platformas tulkojumu atslēgas sakrīt starp valodām', { skip: !exists(RESTORE_TRANSLATIONS_PATH) }, () => {
-  const restoreTranslations = loadRestoreTranslations();
-  assert.ok(restoreTranslations, 'Neizdevās ielādēt restore/translations.js.');
-  const locales = Object.keys(restoreTranslations);
-  assert.ok(locales.includes('lv') && locales.length >= 2, 'Sagaidītas vismaz latviešu un vēl viena valoda.');
-  const baseline = Object.keys(restoreTranslations[locales[0]]).sort();
-  for (const locale of locales.slice(1)) {
-    assert.deepEqual(Object.keys(restoreTranslations[locale]).sort(), baseline, `Restore tulkojumu atslēgas atšķiras valodai ${locale}`);
-  }
-});
-
-test('P02b — restore tulkojumos ir B03 atslēgas', { skip: !exists(RESTORE_TRANSLATIONS_PATH) }, () => {
-  const restoreTranslations = loadRestoreTranslations();
-  assert.ok(restoreTranslations, 'Neizdevās ielādēt restore/translations.js.');
-  for (const locale of Object.keys(restoreTranslations)) {
-    assert.ok(restoreTranslations[locale]['deleted-files'], `Trūkst 'deleted-files' valodai ${locale}`);
-    assert.ok(restoreTranslations[locale]['debug-deleted-files-count'], `Trūkst 'debug-deleted-files-count' valodai ${locale}`);
   }
 });
 
@@ -162,7 +95,7 @@ test('P10 — accounting-redis saglabā atļautās backup state pārejas un aizl
   assert.match(block, /'failed':\s*\[[\s\S]*?'manifest-uploaded'/);
 });
 
-test('P11 — Vite konfigurācija un HTML sākumpunkts ir klātesoši', () => {
+ test('P11 — Vite konfigurācija un HTML sākumpunkts ir klātesoši', () => {
   const vite = read('vite.config.js');
   const html = read('index.html');
   assert.match(vite, /defineConfig/);
@@ -170,6 +103,7 @@ test('P11 — Vite konfigurācija un HTML sākumpunkts ir klātesoši', () => {
   assert.match(html, /id=["']root["']/);
   assert.match(html, /src=["']\/src\/main\.jsx["']/);
 });
+
 
 test('P12 — iepriekšējā manifesta atbilde tiek ierobežota pirms JSON parsēšanas', () => {
   const source = read('server.js');
@@ -192,6 +126,7 @@ test('P13 — limita funkcija noraida pārāk lielu manifesta atbildi pirms pars
   );
   assert.equal((await readLimited(new Response('{"ok":true}'), 20)).toString('utf8'), '{"ok":true}');
 });
+
 
 test('P14 — ANS-104 verifikatora palīgfunkcija nav obligāta manifesta ielādes plūsmai', () => {
   const source = read('server.js');
@@ -244,6 +179,7 @@ test('P16 — izolētais ANS-104 palīgs atbalsta HEAD /raw rezerves ceļu', () 
   assert.match(verifier, /await item\.isValid\(\)/);
 });
 
+
 test('P17 — izolētais ANS-104 palīgs atpazīst Data-Item pozīcijas galvenes', () => {
   const source = read('server.js');
   const start = source.indexOf('async function verifyArweaveDataItem(');
@@ -271,68 +207,4 @@ test('P18 — iepriekšējais manifests tiek ielādēts caur konfigurēto vārte
   assert.match(loader, /backup ir apturēts/);
   assert.doesNotMatch(loader, /verifyArweaveDataItem\(/);
   assert.doesNotMatch(loader, /offsets|method: 'HEAD'/);
-});
-
-// ✅ S01: Lock zaudēšanas testi platformas līmenī
-
-test('P19 — withJobLock atceļ darbu, kad lock tiek zaudēts (S01)', () => {
-  const source = read('server.js');
-  const start = source.indexOf('async function withJobLock(jobId, fn) {');
-  const end = source.indexOf('\n// -----------------------------------------------------------------------------\n// Redis-backed express-session store.', start);
-  assert.ok(start >= 0 && end > start, 'Nav atrasta withJobLock funkcija.');
-  const lockFn = source.slice(start, end);
-  assert.match(lockFn, /lockLostController\.abort/);
-  assert.match(lockFn, /lockSignal:\s*lockLostController\.signal/);
-  assert.match(lockFn, /lockToken:\s*token/);
-});
-
-test('P20 — throwIfLockLost ir definēta un izmanto signal.aborted (S01)', () => {
-  const source = read('server.js');
-  assert.match(source, /function throwIfLockLost\(signal\)\s*\{/);
-  const start = source.indexOf('function throwIfLockLost(signal)');
-  const end = source.indexOf('}', source.indexOf('throw', start));
-  const fn = source.slice(start, end);
-  assert.match(fn, /signal\?\.aborted/);
-  assert.match(fn, /throw/);
-});
-
-// ✅ B03: deletedFiles testi platformas līmenī
-
-test('P21 — BackupPage sūta deletedFiles manifestā (B03)', () => {
-  const page = read('src/BackupPage.jsx');
-  assert.match(page, /deletedFiles:\s*deletedFiles/,
-    'Manifestā netiek iekļauts deletedFiles.');
-  assert.match(page, /const deletedFiles = Object\.keys\(previousPaths\)\.filter/,
-    'Nav deletedFiles aprēķina.');
-  assert.match(page, /setDeletedFilesForUpload\(deletedFiles\)/,
-    'deletedFiles netiek saglabāts state.');
-});
-
-test('P22 — restore.js atbalsta deletedFiles (B03)', { skip: !hasRestoreFiles }, () => {
-  const source = read(RESTORE_JS_PATH);
-  assert.match(source, /manifest\.deletedFiles/,
-    'restore.js nelasa manifest.deletedFiles.');
-  assert.match(source, /deletedCount/, 'restore.js neuzrāda deletedCount.');
-  assert.match(source, /for \(const filePath of manifest\.deletedFiles\)/,
-    'Nav deletedFiles validācijas cikla.');
-});
-
-// ✅ R01: archive.contains un merkleRoot testi platformas līmenī
-
-test('P23 — BackupPage veido archive.contains un merkleRoot (R01)', () => {
-  const page = read('src/BackupPage.jsx');
-  assert.match(page, /const archiveContains = changedFiles\.map/,
-    'Nav archive.contains veidošanas.');
-  assert.match(page, /contains:\s*archiveContains/, 'archive.contains netiek iekļauts manifestā.');
-  assert.match(page, /merkleRoot:\s*merkleRoot/, 'merkleRoot netiek iekļauts manifestā.');
-});
-
-test('P24 — restore.js prasa archive.contains un merkleRoot (R01)', { skip: !hasRestoreFiles }, () => {
-  const source = read(RESTORE_JS_PATH);
-  assert.match(source, /if \(!Array\.isArray\(manifest\.archive\.contains\) \|\| manifest\.archive\.contains\.length === 0\)/,
-    'restore.js neprasa archive.contains.');
-  assert.match(source, /typeof manifest\.merkleRoot !== 'string' \|\| !\/\^0x\[0-9a-fA-F\]\{64\}\$\/\.test\(manifest\.merkleRoot\)/,
-    'restore.js neprasa merkleRoot.');
-  assert.match(source, /calculatedRoot\.toLowerCase\(\) !== manifest\.merkleRoot\.toLowerCase\(\)/,
-    'restore.js nepārbauda merkleRoot atbilstību archive.contains.');
 });

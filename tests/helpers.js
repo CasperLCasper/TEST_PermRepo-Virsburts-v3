@@ -6,12 +6,6 @@ import { fileURLToPath } from 'node:url';
 export const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const backupSource = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
 
-// ✅ Restore platforma atrodas atsevišķi (Arweave permanent web).
-// Ja restore.js nav repozitorijā, tests to nelasa un neizdodas.
-export const restoreSource = fs.existsSync(path.join(root, 'restore.js'))
-  ? fs.readFileSync(path.join(root, 'restore.js'), 'utf8')
-  : null;
-
 export function extractBetween(source, startMarker, endMarker) {
   const start = source.indexOf(startMarker);
   if (start < 0) throw new Error(`Avotā nav atrasta sākuma atzīme: ${startMarker}`);
@@ -34,7 +28,6 @@ export const AR_ID = 'A'.repeat(43);
 export const ZIP_ID = 'B'.repeat(43);
 export const OTHER_ZIP_ID = 'C'.repeat(43);
 
-// ✅ R01: validManifest tagad satur archive.contains un merkleRoot
 export const validManifest = (overrides = {}) => ({
   manifest: 'arweave/paths',
   version: '0.2.0',
@@ -47,11 +40,7 @@ export const validManifest = (overrides = {}) => ({
     ivs: { [ZIP_ID]: Array(12).fill(7) }
   },
   paths: { 'README.md': { zipId: ZIP_ID, hash: 'a'.repeat(64) } },
-  archive: {
-    id: ZIP_ID,
-    contains: [{ path: 'README.md', hash: 'a'.repeat(64) }]
-  },
-  merkleRoot: `0x${'d'.repeat(64)}`,
+  archive: { id: ZIP_ID },
   ...overrides
 });
 

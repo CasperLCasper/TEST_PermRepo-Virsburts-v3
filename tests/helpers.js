@@ -5,7 +5,12 @@ import { fileURLToPath } from 'node:url';
 // The tests are intended to be copied into the actual backup-platform repository.
 export const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const backupSource = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
-export const restoreSource = fs.readFileSync(path.join(root, 'restore.js'), 'utf8');
+
+// ✅ Restore platforma atrodas atsevišķi (Arweave permanent web).
+// Ja restore.js nav repozitorijā, tests to nelasa un neizdodas.
+export const restoreSource = fs.existsSync(path.join(root, 'restore.js'))
+  ? fs.readFileSync(path.join(root, 'restore.js'), 'utf8')
+  : null;
 
 export function extractBetween(source, startMarker, endMarker) {
   const start = source.indexOf(startMarker);

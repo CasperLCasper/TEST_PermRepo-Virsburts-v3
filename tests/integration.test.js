@@ -93,12 +93,17 @@ test('I11 — recovery restores missing ZIP crypto metadata from the local journ
     'Trūkst cryptoVersion atjaunošanas no lokālā recovery žurnāla.');
 });
 
+// ✅ I12 — atjaunināts, lai atbilstu pašreizējai IV atgūšanas loģikai
 test('I12 — existing recovered ZIP is not reused without its original IV', () => {
   const client = fs.readFileSync(path.join(root, 'src/BackupPage.jsx'), 'utf8');
   assert.match(client, /let iv = uploadedZipRef\.current\.iv \|\| recoveredJobData\?\.zipIv \|\| null;/,
     'Atkopšanas ZIP IV netiek paņemts no recoveredJobData.');
-  assert.match(client, /if \(zipTxId && \(!iv \|\| iv\.length !== 12\)\)\s*\{\s*throw new Error\(t\('recovery-upload-incomplete'\)\);/,
-    'Esošs ZIP bez derīga 12 baitu IV netiek apturēts pirms manifesta veidošanas.');
+  assert.match(client, /if \(zipTxId && \(!iv \|\| !Array\.isArray\(iv\) \|\| iv\.length !== 12\)\)/,
+    'Esošs ZIP bez derīga 12 baitu IV netiek pārbaudīts pirms manifesta veidošanas.');
+  assert.match(client, /recoveryJournal\?\.zipIv/,
+    'Netiek mēģināts atgūt IV no recoveryJournal.');
+  assert.match(client, /throw new Error\(t\('recovery-upload-incomplete'\)\);/,
+    'Nav throw, ja IV nav atrodams nekur.');
 });
 
 test('I13 — deletion-only backup izmanto __permrepo_deletions__.json marķieri', () => {
@@ -139,7 +144,6 @@ test('I17 — state machine atļauj blockchain-finalizing → manifest-uploaded'
 test('I18 — withJobLock nodod lockSignal un lockToken (S01)', () => {
   const start = backupSource.indexOf('async function withJobLock(jobId, fn) {');
   assert.ok(start >= 0, 'Nav atrasta withJobLock funkcija.');
-  // ✅ Meklē 3000 simbolus pēc funkcijas sākuma — pietiekami, lai ietvertu visu funkciju
   const lockFn = backupSource.slice(start, start + 3000);
   assert.match(lockFn, /lockLostController\.abort/, 'Lock zaudēšana neizsauc abort.');
   assert.match(lockFn, /lockSignal:\s*lockLostController\.signal/, 'fn() nesaņem lockSignal.');

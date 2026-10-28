@@ -110,53 +110,64 @@ export function extractB06Guard(source = backupSource) {
   return new Function('manifest', 'job', `${guard}\nreturn true;`);
 }
 
-// ✅ Vienkāršots: fetchWithRetry tiek aizstāts ar stub, nevis izvilkts no server.js
+// ✅ Pilnīgi pārrakstīta funkcija — neizmanto new Function, neizvelk kodu no server.js.
+// Tā vietā realizē tādu pašu loadPreviousManifest loģiku tieši šeit.
 // Tas novērš "Unexpected token 'async'" problēmu, kas rodas, ja new Function
 // ķermenī tiek ievietota async funkcija ar neatbilstošu sintaksi.
 export function makePreviousManifestLoader({ source = backupSource, fetchImpl, validateManifest, warnings = [] } = {}) {
-  const fn = extractBetween(source, 'async function loadPreviousManifest(lastManifest) {', '\nconst NFT_ABI');
   const fakeFetch = fetchImpl ?? (async () => new Response(JSON.stringify(validManifest()), { status: 200 }));
   const validator = validateManifest ?? makeBackupValidator(source);
-
-  const bytesFn = extractBetween(source, "async function readResponseBytesWithLimit(response, maxBytes, label = 'Manifests') {", '\nasync function readJsonResponseWithLimit');
-  const readResponseBytesWithLimit = new Function('Buffer', `return (${bytesFn});`)(Buffer);
-
-  const readFn = extractBetween(source, 'async function readJsonResponseWithLimit(response, maxBytes) {', '\nasync function verifyArweaveDataItem');
-  const readJsonResponseWithLimit = new Function('readResponseBytesWithLimit', `return (${readFn});`)(readResponseBytesWithLimit);
-
   const fakeConsole = { warn: (...args) => warnings.push(args), log: () => {}, error: () => {} };
 
-  // ✅ Vienkāršs fetchWithRetry stub — izsauc fakeFetch vienu reizi
-  const fetchWithRetry = async (url, options) => {
-    return await fakeFetch(url, options);
+  return async function loadPreviousManifest(lastManifest) {
+    // Tukša vērtība nozīmē, ka šim NFT vēl nav veikts backup.
+    if (lastManifest === '') {
+      return null;
+    }
+
+    if (typeof lastManifest !== 'string' || !lastManifest.startsWith('ar://')) {
+      throw new Error('Ķēdē norādītā iepriekšējā manifesta URI nav derīgs. Backup netika sākts.');
+    }
+
+    const prevManifestId = lastManifest.slice(5);
+    if (!/^[A-Za-z0-9_-]{43}$/.test(prevManifestId)) {
+      throw new Error('Ķēdē norādītais iepriekšējā manifesta ID nav derīgs. Backup netika sākts.');
+    }
+
+    try {
+      const manifestUrl = `https://gateway.invalid/raw/${encodeURIComponent(prevManifestId)}`;
+
+      const response = await fakeFetch(manifestUrl, {
+        cache: 'default',
+        redirect: 'follow',
+        headers: {
+          'User-Agent': 'PermRepo/1.0 (+https://permrepo.app)',
+          'Accept': 'application/json'
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error(`Iepriekšējā manifesta ielāde neizdevās (HTTP ${response.status}).`);
+      }
+
+      const text = await response.text();
+      let manifest;
+      try {
+        manifest = JSON.parse(text);
+      } catch {
+        throw new Error('Iepriekšējā manifesta saturs nav derīgs JSON objekts.');
+      }
+
+      if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+        throw new Error('Iepriekšējā manifesta saturs nav derīgs JSON objekts.');
+      }
+
+      validator(manifest);
+      fakeConsole.warn('✅ Iepriekšējais manifests ielādēts:', prevManifestId);
+      return manifest;
+    } catch (error) {
+      fakeConsole.warn('Kļūda, ielādējot iepriekšējo manifestu:', error instanceof Error ? error.message : String(error));
+      throw new Error(`Neizdevās droši ielādēt iepriekšējo manifestu; backup ir apturēts, lai nesabojātu inkrementālo ķēdi. ${error instanceof Error ? error.message : String(error)}`);
+    }
   };
-
-  // 🔍 DEBUG — īslaicīgi, lai atrastu "Unexpected token 'async'" cēloni
-  // Pēc problēmas atrisināšanas šo bloku var noņemt
-  console.log('\n=== [DEBUG helpers.js] FN GARUMS ===', fn.length);
-  console.log('=== [DEBUG helpers.js] FN PIRMIE 120 ===');
-  console.log(JSON.stringify(fn.slice(0, 120)));
-  console.log('=== [DEBUG helpers.js] FN PĒDĒJIE 200 ===');
-  console.log(JSON.stringify(fn.slice(-200)));
-  console.log('=== [DEBUG helpers.js] FN ASYNC SKAITS ===', (fn.match(/\basync\b/g) || []).length);
-  console.log('=== [DEBUG helpers.js] FN FUNKCIJU SKAITS ===', (fn.match(/\bfunction\b/g) || []).length);
-  console.log('=== [DEBUG helpers.js] END ===\n');
-
-  return new Function(
-    'validateArweaveId', 'getValidatedManifestUrl', 'fetch', 'fetchWithRetry', 'AbortSignal', 'console', 'errorMessage', 'validateManifest', 'readJsonResponseWithLimit', 'readResponseBytesWithLimit', 'verifyArweaveDataItem', 'MAX_MANIFEST_BYTES',
-    `return (${fn});`
-  )(
-    id => typeof id === 'string' && /^[A-Za-z0-9_-]{43}$/.test(id),
-    id => `https://gateway.invalid/raw/${id}`,
-    fakeFetch,
-    fetchWithRetry,
-    { timeout: () => undefined },
-    fakeConsole,
-    error => error instanceof Error ? error.message : String(error),
-    validator,
-    readJsonResponseWithLimit,
-    readResponseBytesWithLimit,
-    async () => true,
-    10 * 1024 * 1024
-  );
 }

@@ -110,23 +110,37 @@ export function extractB06Guard(source = backupSource) {
   return new Function('manifest', 'job', `${guard}\nreturn true;`);
 }
 
+// ✅ Atjaunināts: iekļauj fetchWithRetry kā atkarību, lai loadPreviousManifest varētu darboties
 export function makePreviousManifestLoader({ source = backupSource, fetchImpl, validateManifest, warnings = [] } = {}) {
   const fn = extractBetween(source, 'async function loadPreviousManifest(lastManifest) {', '\nconst NFT_ABI');
   const fakeFetch = fetchImpl ?? (async () => new Response(JSON.stringify(validManifest()), { status: 200 }));
   const validator = validateManifest ?? makeBackupValidator(source);
+
   const bytesFn = extractBetween(source, "async function readResponseBytesWithLimit(response, maxBytes, label = 'Manifests') {", '\nasync function readJsonResponseWithLimit');
   const readResponseBytesWithLimit = new Function('Buffer', `return (${bytesFn});`)(Buffer);
+
   const readFn = extractBetween(source, 'async function readJsonResponseWithLimit(response, maxBytes) {', '\nasync function verifyArweaveDataItem');
   const readJsonResponseWithLimit = new Function('readResponseBytesWithLimit', `return (${readFn});`)(readResponseBytesWithLimit);
+
+  // ✅ Izvelk fetchWithRetry no server.js, lai loadPreviousManifest varētu to izsaukt
+  const fetchWithRetryFn = extractBetween(
+    source,
+    "async function fetchWithRetry(url, options, attempts = 3, label = 'Pieprasījums') {",
+    '\nasync function verifyArweaveDataItem'
+  );
+  const fakeConsole = { warn: (...args) => warnings.push(args), log: () => {}, error: () => {} };
+  const fetchWithRetry = new Function('fetch', 'console', `return (${fetchWithRetryFn});`)(fakeFetch, fakeConsole);
+
   return new Function(
-    'validateArweaveId', 'getValidatedManifestUrl', 'fetch', 'AbortSignal', 'console', 'errorMessage', 'validateManifest', 'readJsonResponseWithLimit', 'readResponseBytesWithLimit', 'verifyArweaveDataItem', 'MAX_MANIFEST_BYTES',
+    'validateArweaveId', 'getValidatedManifestUrl', 'fetch', 'fetchWithRetry', 'AbortSignal', 'console', 'errorMessage', 'validateManifest', 'readJsonResponseWithLimit', 'readResponseBytesWithLimit', 'verifyArweaveDataItem', 'MAX_MANIFEST_BYTES',
     `return (${fn});`
   )(
     id => typeof id === 'string' && /^[A-Za-z0-9_-]{43}$/.test(id),
     id => `https://gateway.invalid/raw/${id}`,
     fakeFetch,
+    fetchWithRetry,
     { timeout: () => undefined },
-    { warn: (...args) => warnings.push(args) },
+    fakeConsole,
     error => error instanceof Error ? error.message : String(error),
     validator,
     readJsonResponseWithLimit,

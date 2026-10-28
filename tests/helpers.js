@@ -1,10 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ethers } from 'ethers';
 
-// The tests are intended to be copied into the actual backup-platform repository.
 export const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const backupSource = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
+
+export const restoreSource = fs.existsSync(path.join(root, 'restore.js'))
+  ? fs.readFileSync(path.join(root, 'restore.js'), 'utf8')
+  : null;
 
 export function extractBetween(source, startMarker, endMarker) {
   const start = source.indexOf(startMarker);
@@ -28,28 +32,59 @@ export const AR_ID = 'A'.repeat(43);
 export const ZIP_ID = 'B'.repeat(43);
 export const OTHER_ZIP_ID = 'C'.repeat(43);
 
-export const validManifest = (overrides = {}) => ({
-  manifest: 'arweave/paths',
-  version: '0.2.0',
-  metadata: { repo: 'test/repo', repositoryId: 1421380729 },
-  encryption: {
-    algorithm: 'AES-GCM',
-    kdf: 'HKDF-SHA-256',
-    version: 1,
-    keyVerifier: `0x${'c'.repeat(64)}`,
-    ivs: { [ZIP_ID]: Array(12).fill(7) }
-  },
-  paths: { 'README.md': { zipId: ZIP_ID, hash: 'a'.repeat(64) } },
-  archive: { id: ZIP_ID },
-  ...overrides
-});
+// ✅ Aprēķina Merkle root tāpat kā server.js/restore.js
+export function calculateArchiveMerkleRoot(contains) {
+  if (!Array.isArray(contains)) throw new Error('invalid');
+  if (contains.length === 0) return `0x${'0'.repeat(64)}`;
+  const hashes = contains.map(entry => {
+    if (!entry || typeof entry.path !== 'string' ||
+        typeof entry.hash !== 'string' || !/^[0-9a-fA-F]{64}$/.test(entry.hash)) {
+      throw new Error('invalid');
+    }
+    return ethers.keccak256(ethers.toUtf8Bytes(entry.hash));
+  });
+  return ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(['bytes32[]'], [hashes]));
+}
+
+// ✅ Atjaunināts validManifest ar archive.contains un merkleRoot
+export const validManifest = (overrides = {}) => {
+  const contains = [{ path: 'README.md', hash: 'a'.repeat(64) }];
+  return {
+    manifest: 'arweave/paths',
+    version: '0.2.0',
+    metadata: { repo: 'test/repo', repositoryId: 1421380729 },
+    encryption: {
+      algorithm: 'AES-GCM',
+      kdf: 'HKDF-SHA-256',
+      version: 1,
+      keyVerifier: `0x${'c'.repeat(64)}`,
+      ivs: { [ZIP_ID]: Array(12).fill(7) }
+    },
+    paths: { 'README.md': { zipId: ZIP_ID, hash: 'a'.repeat(64) } },
+    archive: {
+      id: ZIP_ID,
+      contains
+    },
+    merkleRoot: calculateArchiveMerkleRoot(contains),
+    ...overrides
+  };
+};
 
 export function makeBackupValidator(source = backupSource) {
   const fn = extractBetween(source, 'function validateManifest(manifest) {', '\nasync function verifyJobAuthorization');
-  return new Function('validateArweaveId', 'MAX_MANIFEST_BYTES', 'Buffer', `return (${fn});`)(
+  return new Function(
+    'validateArweaveId',
+    'MAX_MANIFEST_BYTES',
+    'Buffer',
+    'calculateArchiveMerkleRoot',
+    'ethers',
+    `return (${fn});`
+  )(
     id => typeof id === 'string' && /^[A-Za-z0-9_-]{43}$/.test(id),
     10 * 1024 * 1024,
-    Buffer
+    Buffer,
+    calculateArchiveMerkleRoot,
+    ethers
   );
 }
 

@@ -22,6 +22,7 @@ import {
     createJob,
     getJob,
     updateJob,
+    resolveJobTtl,
     acquireJobLock,
     releaseJobLock,
     extendJobLock
@@ -481,6 +482,32 @@ const mintAuthorizationSigner = new ethers.Wallet(
     MINT_AUTHORIZATION_SIGNER_PRIVATE_KEY
 );
 
+// ✅ P1-1: Aprēķina Merkle sakni no archive.contains
+function calculateArchiveMerkleRoot(contains) {
+    if (!Array.isArray(contains)) {
+        throw new Error('archive.contains nav masīvs.');
+    }
+    if (contains.length === 0) {
+        return `0x${'0'.repeat(64)}`;
+    }
+    const hashes = contains.map(entry => {
+        if (!entry || typeof entry !== 'object' || typeof entry.path !== 'string' ||
+            typeof entry.hash !== 'string' || !/^[0-9a-fA-F]{64}$/.test(entry.hash)) {
+            throw new Error('Nederīgs archive.contains ieraksts.');
+        }
+        if (entry.path.length < 1 || entry.path.length > 1000 ||
+            entry.path.startsWith('/') || entry.path.startsWith('\\') || /^[a-zA-Z]:/.test(entry.path) ||
+            entry.path.includes('\\') || entry.path.split('/').some(part => part === '..' || part === '.') ||
+            /[\x00-\x1f]/.test(entry.path)) {
+            throw new Error('Nederīgs ceļš archive.contains ierakstā.');
+        }
+        return ethers.keccak256(ethers.toUtf8Bytes(entry.hash));
+    });
+    return ethers.keccak256(
+        ethers.AbiCoder.defaultAbiCoder().encode(['bytes32[]'], [hashes])
+    );
+}
+
 // ✅ Droša Arweave manifesta ielāde (servera pusē)
 function getValidatedManifestUrl(manifestId, gatewayOverride = ARWEAVE_GATEWAY) {
     if (!validateArweaveId(manifestId)) {
@@ -547,13 +574,7 @@ async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchI
         throw new Error('Vārtejas atdotā manifesta ID neatbilst pieprasītajam ID.');
     }
 
-    // AR.IO versijas atšķirīgi atklāj ANS-104 atrašanās vietu. Dažas atbildes
-    // satur X-AR-IO-Root-Item-* galvenes, citas — tikai root transaction ID.
-    // Galvenes ir tikai atrašanās vietas norāde; autentiskumu pierāda DataItem
-    // paraksts, datu vienuma ID un precīza satura salīdzinājums zemāk.
     let rootTxId = response.headers.get('x-ar-io-root-transaction-id');
-    // AR.IO dokumentācijā standarta pozīcijas galvenes ir Data-Item-*;
-    // dažas versijas/vārtejas joprojām atgriež Root-Item-* vai Root-Data-*.
     let offsetText = response.headers.get('x-ar-io-data-item-offset') ||
         response.headers.get('x-ar-io-root-item-offset') ||
         response.headers.get('x-ar-io-root-data-item-offset') ||
@@ -577,8 +598,6 @@ async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchI
 
     let location = parseLocation();
     if (!location) {
-        // 1) Lētais AR.IO offsets indekss. Ne visas vārtejas vai visi nesen
-        // augšupielādētie vienumi jau ir indeksēti, tāpēc 404 nav galīgā atbilde.
         const gatewayOrigin = new URL(getValidatedManifestUrl(manifestId, sourceGateway)).origin;
         let offsetsError = null;
         try {
@@ -606,10 +625,6 @@ async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchI
             offsetsError = error?.name === 'TimeoutError' ? 'taimauts' : 'tīkla kļūda';
         }
 
-        // 2) Oficiāli dokumentētais rezerves ceļš: HEAD /raw/{id}. Tas var
-        // palaist parasto vārtejas atrašanas ķēdi un atdot root/item galvenes.
-        // Galvenes ir tikai atrašanās vietas norāde; tās nekad neaizstāj
-        // DataItem paraksta, ID un precīza satura pārbaudi zemāk.
         if (!location) {
             let headResponse;
             try {
@@ -620,8 +635,6 @@ async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchI
                     signal: AbortSignal.timeout(30000),
                     headers: {
                         Accept: 'application/octet-stream',
-                        // Ja sākotnējā atbilde jau atklāja root TX ID, dodam to
-                        // kā dokumentētu norādi, lai vārtejai nav jāsāk no nulles.
                         ...(validateArweaveId(rootTxId)
                             ? { 'X-AR-IO-Root-Transaction-Id': rootTxId }
                             : {})
@@ -674,13 +687,10 @@ async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchI
 }
 
 async function loadPreviousManifest(lastManifest) {
-    // Tukša vērtība nozīmē, ka šim NFT vēl nav veikts backup.
     if (lastManifest === '') {
         return null;
     }
 
-    // Ja ķēdē ir norādīts manifests, bet tā URI ir bojāts, backup jāpārtrauc.
-    // Nedrīkst klusējot pāriet uz pilnu backup un pazaudēt inkrementālo ķēdi.
     if (typeof lastManifest !== 'string' || !lastManifest.startsWith('ar://')) {
         throw new Error('Ķēdē norādītā iepriekšējā manifesta URI nav derīgs. Backup netika sākts.');
     }
@@ -702,14 +712,11 @@ async function loadPreviousManifest(lastManifest) {
             throw new Error(`Iepriekšējā manifesta ielāde neizdevās (HTTP ${response.status}).`);
         }
 
-        // Saglabāts esošais 10 MB limits; tas tiek piemērots pirms JSON parsēšanas.
         const manifest = await readJsonResponseWithLimit(response, MAX_MANIFEST_BYTES);
         if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
             throw new Error('Iepriekšējā manifesta saturs nav derīgs JSON objekts.');
         }
 
-        // Nekad neizmanto iepriekšējo manifestu inkrementālajam backup,
-        // pirms nav pārbaudīta visa tā struktūra un šifrēšanas metadati.
         validateManifest(manifest);
         return manifest;
     } catch (error) {
@@ -737,7 +744,6 @@ const SUBSCRIPTION_ABI = [
     'function subscriptionPrice() external view returns (uint256)'
 ];
 
-// ✅ BackupAdded event ABI
 const BACKUP_ADDED_EVENT_ABI = [
     'event BackupAdded(uint256 indexed tokenId, uint256 indexed backupNumber, bytes32 indexed merkleRoot, bytes32 manifestHash, string manifestURI, uint256 nonce)'
 ];
@@ -771,7 +777,6 @@ function getAllowedConnectOrigins() {
     return [...origins].join(' ');
 }
 
-// ✅ S01: lock zaudēšanas signalizācija
 function throwIfLockLost(signal) {
     if (signal?.aborted) {
         throw signal.reason instanceof Error
@@ -821,10 +826,6 @@ async function withJobLock(jobId, fn) {
         await releaseJobLock(jobId, token);
     }
 }
-
-// -----------------------------------------------------------------------------
-// Redis-backed express-session store.
-// -----------------------------------------------------------------------------
 
 class UpstashSessionStore extends session.Store {
     constructor(redisClient, ttlSeconds) {
@@ -1482,7 +1483,7 @@ function validateJobTxInput(jobId, txId) {
     }
 }
 
-// ✅ B03 + R01: Papildināta manifesta validācija
+// ✅ B03 + R01 + P1-1: Papildināta manifesta validācija
 function validateManifest(manifest) {
     if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
         throw new Error('Manifests nav derīgs objekts.');
@@ -1553,7 +1554,7 @@ function validateManifest(manifest) {
         throw new Error('Manifesta archive ID nav derīgs.');
     }
 
-    // ✅ R01: Jaunajiem manifestiem (encryption.version === 1) archive.contains un merkleRoot ir obligāti
+    // ✅ R01: archive.contains un merkleRoot ir obligāti
     if (encryption.version === 1) {
         if (!manifest.archive || typeof manifest.archive !== 'object' || Array.isArray(manifest.archive)) {
             throw new Error('Manifesta archive nav derīgs.');
@@ -1565,7 +1566,6 @@ function validateManifest(manifest) {
             throw new Error('Manifesta merkleRoot nav derīgs.');
         }
 
-        // Pārbauda, ka archive.contains atbilst paths (katram contains ierakstam jābūt paths ar tādu pašu hash)
         const containsPaths = new Set();
         for (const entry of manifest.archive.contains) {
             if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
@@ -1587,6 +1587,12 @@ function validateManifest(manifest) {
             if (!pathInfo || pathInfo.hash.toLowerCase() !== entry.hash.toLowerCase()) {
                 throw new Error(`Manifesta archive.contains hash nesakrīt ar paths: ${entry.path}`);
             }
+        }
+
+        // ✅ P1-1: Pārrēķina Merkle sakni un salīdzina ar manifest.merkleRoot
+        const calculatedRoot = calculateArchiveMerkleRoot(manifest.archive.contains);
+        if (calculatedRoot.toLowerCase() !== manifest.merkleRoot.toLowerCase()) {
+            throw new Error('Manifesta merkleRoot nesakrīt ar aprēķināto no archive.contains.');
         }
     }
 
@@ -1618,8 +1624,6 @@ async function verifyJobAuthorization(req, job) {
         throw new Error('Nav GitHub autorizācijas.');
     }
 
-    // Jaunajiem job autorizācija balstās uz nemaināmo GitHub user ID.
-    // Vecā job login pārbaude saglabāta tikai iepriekš izveidotu job pabeigšanai.
     if (job.githubUserId != null) {
         if (String(req.session.githubUserId) !== String(job.githubUserId)) {
             throw new Error('GitHub konts nesakrīt ar backup job.');
@@ -1938,8 +1942,6 @@ app.post('/api/mint-authorization', mintAuthorizationLimiter, async (req, res) =
 
         const repoData = await getGitHubRepositoryById(githubToken, id);
 
-        // Sākotnējo deskriptoru drīkst izveidot tikai personīgā repo īpašnieks.
-        // Pēc repo pārvietošanas jau esošo deskriptoru turpina lietot pēc repo ID.
         if (repoData.ownerId !== githubUserId) {
             return res.status(403).json({ success: false, error: 'Jaunu On-chain Deskriptoru var izveidot tikai repozitorija īpašnieks.' });
         }
@@ -1954,7 +1956,6 @@ app.post('/api/mint-authorization', mintAuthorizationLimiter, async (req, res) =
             return res.status(409).json({ success: false, error: 'Šim GitHub repozitorijam On-chain Deskriptors jau eksistē.' });
         }
 
-        // ✅ Iegūst nonce un defaultURI no kontrakta
         const provider = getProvider();
         const nftContract = new ethers.Contract(NFT_ADDRESS, NFT_ABI, provider);
 
@@ -1983,7 +1984,6 @@ app.post('/api/mint-authorization', mintAuthorizationLimiter, async (req, res) =
 
         const deadline = Math.floor(Date.now() / 1000) + MINT_AUTHORIZATION_TTL_SECONDS;
 
-        // ✅ EIP-712 domain
         const domain = {
             name: 'PermRepo',
             version: '1',
@@ -1991,7 +1991,6 @@ app.post('/api/mint-authorization', mintAuthorizationLimiter, async (req, res) =
             verifyingContract: NFT_ADDRESS
         };
 
-        // ✅ EIP-712 types
         const types = {
             MintRepository: [
                 { name: 'recipient', type: 'address' },
@@ -2012,7 +2011,6 @@ app.post('/api/mint-authorization', mintAuthorizationLimiter, async (req, res) =
             nonce: currentNonce
         };
 
-        // ✅ Paraksta ar backend wallet
         let signature;
         try {
             signature = await mintAuthorizationSigner.signTypedData(
@@ -2182,9 +2180,7 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
             maxFileBytes = Math.max(maxFileBytes, blob.size);
         }
 
-        // ✅ Serveris ielādē iepriekšējo manifestu un sadala changed/unchanged
         const previousManifest = await loadPreviousManifest(lastManifest);
-        // ✅ Object.create(null) pret __proto__ robustness
         const previousPaths =
             previousManifest &&
             previousManifest.paths &&
@@ -2269,7 +2265,6 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
 
         const jobFiles = [];
         const changedFileMetadata = [];
-        // ✅ Object.create(null) pret __proto__ robustness
         const unchangedFiles = Object.create(null);
         let totalBytes = 0;
 
@@ -2296,7 +2291,6 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
                 size: file.size
             });
 
-            // ✅ Sadala changed/unchanged servera pusē
             const previousFile = previousPaths[file.path];
 
             if (
@@ -2324,13 +2318,12 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
             });
         });
 
-        // ✅ B03: Aprēķina deletedFiles (bija iepriekšējā manifestā, bet vairs nav)
         const currentPaths = new Set(jobFiles.map(f => f.path));
         const deletedFiles = Object.keys(previousPaths).filter(
             path => !currentPaths.has(path)
         );
 
-        // ✅ Job satur TIKAI metadata (bez base64 satura)
+        // ✅ P2-2: Aprēķina TTL pēc statusa
         const job = {
             version: 7,
             jobId,
@@ -2348,10 +2341,8 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
             onChainBackupCount: backupCount.toString(),
             lastManifest: lastManifest || null,
             lastMerkleRoot: lastMerkleRoot || null,
-            // ✅ TIKAI changed failu metadata
             changedFileMetadata,
             unchangedFiles,
-            // ✅ B03: dzēstie faili
             deletedFiles,
             status: 'prepared',
             cryptoVersion: 1,
@@ -2371,7 +2362,8 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
             updatedAt: now
         };
 
-        await createJob(jobId, job, JOB_TTL_SECONDS);
+        // ✅ P2-2: Izmanto resolveJobTtl() statusam atbilstošu TTL
+        await createJob(jobId, job, resolveJobTtl(job));
 
         await writeNdjson(res, {
             type: 'complete',
@@ -2482,7 +2474,6 @@ app.get('/api/job-status', async (req, res) => {
 
         await verifyJobAuthorization(req, job);
 
-        // ✅ Drošā versija: iegūst on-chain backupCount tikai ja tokenId eksistē
         let backupCount = null;
 
         if (job.tokenId != null) {
@@ -2505,7 +2496,6 @@ app.get('/api/job-status', async (req, res) => {
             }
         }
 
-        // ✅ Atgriež metadata (bez base64 satura)
         return res.json({
             success: true,
             jobId: job.jobId,
@@ -2564,7 +2554,7 @@ app.post('/api/start-zip-upload', backupLimiter, async (req, res) => {
             });
         }
 
-        return await withJobLock(jobId, async ({ lockSignal }) => {
+        return await withJobLock(jobId, async ({ lockSignal, lockToken }) => {
             throwIfLockLost(lockSignal);
 
             const job = await getJob(jobId);
@@ -2581,11 +2571,12 @@ app.post('/api/start-zip-upload', backupLimiter, async (req, res) => {
 
             if (job.status === 'prepared') {
                 throwIfLockLost(lockSignal);
+                // ✅ P2-3: Nodod lockToken
                 await updateJob(jobId, {
                     status: 'zip-uploading',
                     zipUploadStartedAt: Date.now(),
                     updatedAt: Date.now()
-                }, JOB_TTL_SECONDS);
+                }, JOB_TTL_SECONDS, { lockToken });
             } else if (job.status !== 'zip-uploading') {
                 throw new Error(
                     `Nevar sākt ZIP augšupielādi no statusa: ${job.status}`
@@ -2620,7 +2611,6 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
             });
         }
 
-        // ✅ Stingrāka IV validācija
         let normalizedIV = null;
         if (iv !== undefined && iv !== null) {
             if (!Array.isArray(iv) || iv.length !== 12) {
@@ -2642,7 +2632,6 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
             normalizedIV = iv.map(b => b);
         }
 
-        // Merkle root validācija (ja padots)
         let normalizedMerkleRoot = null;
         if (merkleRoot !== undefined && merkleRoot !== null) {
             if (
@@ -2672,7 +2661,6 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
             });
             throwIfLockLost(lockSignal);
 
-            // ✅ Idempotence
             if (
                 job.status === 'zip-uploaded' ||
                 job.status === 'manifest-uploading' ||
@@ -2706,8 +2694,6 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
                 );
             }
 
-            // Atkopšana, ja Turbo atdeva ZIP ID, bet Redis ieraksts neizdevās.
-            // Atļaujam to tikai tad, ja šim job iepriekš tiešām sākta ZIP augšupielāde.
             if (
                 job.status === 'failed' &&
                 job.zipUploadStartedAt &&
@@ -2796,7 +2782,7 @@ app.post('/api/start-manifest-upload', backupLimiter, async (req, res) => {
             });
         }
 
-        return await withJobLock(jobId, async ({ lockSignal }) => {
+        return await withJobLock(jobId, async ({ lockSignal, lockToken }) => {
             throwIfLockLost(lockSignal);
 
             const job = await getJob(jobId);
@@ -2813,11 +2799,12 @@ app.post('/api/start-manifest-upload', backupLimiter, async (req, res) => {
 
             if (job.status === 'zip-uploaded') {
                 throwIfLockLost(lockSignal);
+                // ✅ P2-3: Nodod lockToken
                 await updateJob(jobId, {
                     status: 'manifest-uploading',
                     manifestUploadStartedAt: Date.now(),
                     updatedAt: Date.now()
-                }, JOB_TTL_SECONDS);
+                }, JOB_TTL_SECONDS, { lockToken });
             } else if (job.status !== 'manifest-uploading') {
                 throw new Error(
                     `Nevar sākt manifesta augšupielādi no statusa: ${job.status}`
@@ -2862,8 +2849,6 @@ app.post('/api/save-manifest-tx', backupLimiter, async (req, res) => {
             });
             throwIfLockLost(lockSignal);
 
-            // ✅ B06: piesaista manifestu tieši GitHub repozitorijam,
-            // kuram šis backup job tika izveidots.
             const manifestRepositoryId = String(manifest.metadata.repositoryId);
             const jobRepositoryId = String(job.githubRepositoryId ?? '');
 
@@ -2880,7 +2865,33 @@ app.post('/api/save-manifest-tx', backupLimiter, async (req, res) => {
                 throw new Error('ZIP transakcija vēl nav saglabāta.');
             }
 
-            // ✅ Idempotence
+            // ✅ P1-1: IV pārbaude pret ZIP kontrolpunktu
+            const manifestIV = manifest.encryption?.ivs?.[job.zipTxId];
+            if (!Array.isArray(manifestIV) || manifestIV.length !== 12) {
+                throw new Error('Manifestā trūkst ZIP IV vai tas nav derīgs.');
+            }
+            if (JSON.stringify(manifestIV) !== JSON.stringify(job.zipIv)) {
+                throw new Error('Manifesta ZIP IV nesakrīt ar saglabāto ZIP IV.');
+            }
+
+            // ✅ P1-1: Merkle saknes pārbaude pret ZIP kontrolpunktu
+            const manifestMerkleRoot = calculateArchiveMerkleRoot(manifest.archive.contains);
+            if (manifestMerkleRoot.toLowerCase() !== String(job.zipMerkleRoot).toLowerCase()) {
+                throw new Error('Manifesta archive.contains nesakrīt ar ZIP posmā saglabāto Merkle root.');
+            }
+            if (manifest.merkleRoot.toLowerCase() !== String(job.zipMerkleRoot).toLowerCase()) {
+                throw new Error('Manifesta merkleRoot nesakrīt ar ZIP posmā saglabāto Merkle root.');
+            }
+
+            // ✅ P1-1: Visi job.changedFileMetadata faili ir iekļauti archive.contains
+            const changedPaths = new Set((job.changedFileMetadata || []).map(f => f.path));
+            const containsPaths = new Set(manifest.archive.contains.map(e => e.path));
+            for (const changedPath of changedPaths) {
+                if (!containsPaths.has(changedPath)) {
+                    throw new Error(`Manifesta archive.contains trūkst ZIP faila: ${changedPath}`);
+                }
+            }
+
             if (
                 job.status === 'manifest-uploaded' ||
                 job.status === 'blockchain-finalizing' ||
@@ -2898,7 +2909,6 @@ app.post('/api/save-manifest-tx', backupLimiter, async (req, res) => {
                 );
             }
 
-            // ✅ Recovery no failed → manifest-uploaded
             if (
                 job.status === 'failed' &&
                 job.manifestUploadStartedAt &&
@@ -3180,7 +3190,6 @@ app.post('/api/save-backup-tx', backupLimiter, async (req, res) => {
                 );
             }
 
-            // ✅ Idempotence
             if (job.backupTxHash) {
                 if (job.backupTxHash === txHash) {
                     return res.json({
@@ -3253,7 +3262,6 @@ app.post('/api/complete-backup', backupLimiter, async (req, res) => {
             });
             throwIfLockLost(lockSignal);
 
-            // ✅ Idempotence
             if (job.status === 'completed') {
                 if (job.completionTxHash === txHash) {
                     return res.json({
@@ -3293,8 +3301,29 @@ app.post('/api/complete-backup', backupLimiter, async (req, res) => {
                 throw new Error('Transakcija vēl nav apstiprināta.');
             }
 
+            // ✅ P1-4: Ja transakcija ir iekļauta blokā, bet neizdevās,
+            // atgriežam darbu uz manifest-uploaded, lai varētu mēģināt vēlreiz
             if (receipt.status !== 1) {
-                throw new Error('Transakcija neizdevās.');
+                throwIfLockLost(lockSignal);
+                await updateJob(jobId, {
+                    status: 'manifest-uploaded',
+                    retryableBlockchainFailure: true,
+                    backupTxHash: null,
+                    backupTxSubmittedAt: null,
+                    error: 'Blockchain transakcija neizdevās — var mēģināt vēlreiz.',
+                    failedAt: Date.now(),
+                    updatedAt: Date.now()
+                }, JOB_TTL_SECONDS, { lockToken });
+
+                logSection('⚠️ BLOCKCHAIN TRANSACTION FAILED');
+                logInfo('Job ID', jobId);
+                logInfo('Tx Hash', txHash);
+
+                return res.status(400).json({
+                    success: false,
+                    error: 'Blockchain transakcija neizdevās — var mēģināt vēlreiz.',
+                    retryableBlockchainFailure: true
+                });
             }
 
             if (receipt.to?.toLowerCase() !== NFT_ADDRESS.toLowerCase()) {
@@ -3305,7 +3334,6 @@ app.post('/api/complete-backup', backupLimiter, async (req, res) => {
                 throw new Error('Transakcija nav no backup maka.');
             }
 
-            // ✅ Pārbauda BackupAdded event no receipt logs
             const iface = new ethers.Interface(BACKUP_ADDED_EVENT_ABI);
             let backupAddedEvent = null;
 
@@ -3313,7 +3341,7 @@ app.post('/api/complete-backup', backupLimiter, async (req, res) => {
                 if (log.address.toLowerCase() !== NFT_ADDRESS.toLowerCase()) {
                     continue;
                 }
-                
+
                 try {
                     const parsed = iface.parseLog(log);
                     if (parsed && parsed.name === 'BackupAdded') {
@@ -3329,7 +3357,6 @@ app.post('/api/complete-backup', backupLimiter, async (req, res) => {
                 );
             }
 
-            // ✅ Salīdzina event ar Redis job
             if (backupAddedEvent.args.tokenId.toString() !== String(job.tokenId)) {
                 throw new Error('BackupAdded tokenId nesakrīt.');
             }
@@ -3426,7 +3453,6 @@ app.post('/api/fail-backup', backupLimiter, async (req, res) => {
                 });
             }
 
-            // ✅ Neļauj failed no blockchain-finalizing ar backupTxHash
             if (
                 job.status === 'blockchain-finalizing' &&
                 job.backupTxHash

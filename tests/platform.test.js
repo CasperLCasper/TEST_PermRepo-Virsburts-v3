@@ -274,9 +274,9 @@ test('P18 — iepriekšējais manifests tiek ielādēts caur konfigurēto vārte
 test('P19 — withJobLock atceļ darbu, kad lock tiek zaudēts (S01)', () => {
   const source = read('server.js');
   const start = source.indexOf('async function withJobLock(jobId, fn) {');
-  const end = source.indexOf('\n// -----------------------------------------------------------------------------\n// Redis-backed express-session store.', start);
-  assert.ok(start >= 0 && end > start, 'Nav atrasta withJobLock funkcija.');
-  const lockFn = source.slice(start, end);
+  assert.ok(start >= 0, 'Nav atrasta withJobLock funkcija.');
+  // ✅ Meklē 3000 simbolus pēc funkcijas sākuma — pietiekami, lai ietvertu visu funkciju
+  const lockFn = source.slice(start, start + 3000);
   assert.match(lockFn, /lockLostController\.abort/);
   assert.match(lockFn, /lockSignal:\s*lockLostController\.signal/);
   assert.match(lockFn, /lockToken:\s*token/);

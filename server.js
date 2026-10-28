@@ -477,7 +477,6 @@ function getProvider() {
     return new ethers.JsonRpcProvider(RPC_URL, EXPECTED_CHAIN_ID);
 }
 
-// ✅ Mint authorization signer
 const mintAuthorizationSigner = new ethers.Wallet(
     MINT_AUTHORIZATION_SIGNER_PRIVATE_KEY
 );
@@ -508,7 +507,6 @@ function calculateArchiveMerkleRoot(contains) {
     );
 }
 
-// ✅ Droša Arweave manifesta ielāde (servera pusē)
 function getValidatedManifestUrl(manifestId, gatewayOverride = ARWEAVE_GATEWAY) {
     if (!validateArweaveId(manifestId)) {
         throw new Error('Nederīgs manifesta ID.');
@@ -568,6 +566,32 @@ async function readJsonResponseWithLimit(response, maxBytes) {
     return JSON.parse(bytes.toString('utf8'));
 }
 
+// ✅ Jauna palīgfunkcija: fetch ar retry
+async function fetchWithRetry(url, options, attempts = 3, label = 'Pieprasījums') {
+    let lastError;
+    for (let i = 0; i < attempts; i++) {
+        try {
+            const response = await fetch(url, options);
+            if (response.ok) return response;
+
+            lastError = new Error(`HTTP ${response.status}`);
+            // Ja 4xx (izņemot 429), nav jēgas atkārtot
+            if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+                return response;
+            }
+        } catch (error) {
+            lastError = error;
+        }
+
+        if (i < attempts - 1) {
+            const delay = 2000 * (i + 1);
+            console.warn(`${label}: mēģinājums ${i + 1}/${attempts} neizdevās (${lastError?.message}), atkārto pēc ${delay}ms`);
+            await new Promise(r => setTimeout(r, delay));
+        }
+    }
+    throw lastError || new Error(`${label} neizdevās pēc ${attempts} mēģinājumiem.`);
+}
+
 async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchImpl = fetch, sourceGateway = ARWEAVE_GATEWAY) {
     const responseId = response.headers.get('x-ar-io-data-id');
     if (responseId !== manifestId) {
@@ -604,9 +628,9 @@ async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchI
             const offsetsUrl = `${gatewayOrigin}/ar-io/offsets/${encodeURIComponent(manifestId)}`;
             const offsetsResponse = await fetchImpl(offsetsUrl, {
                 cache: 'no-store',
-                redirect: 'error',
-                signal: AbortSignal.timeout(15000),
-                headers: { Accept: 'application/json' }
+                redirect: 'follow',
+                signal: AbortSignal.timeout(30000),
+                headers: { Accept: 'application/json', 'User-Agent': 'PermRepo/1.0' }
             });
             if (offsetsResponse.ok) {
                 const offsetsBytes = await readResponseBytesWithLimit(offsetsResponse, 64 * 1024, 'ANS-104 offsets atbilde');
@@ -631,10 +655,11 @@ async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchI
                 headResponse = await fetchImpl(`${gatewayOrigin}/raw/${encodeURIComponent(manifestId)}`, {
                     method: 'HEAD',
                     cache: 'no-store',
-                    redirect: 'error',
+                    redirect: 'follow',
                     signal: AbortSignal.timeout(30000),
                     headers: {
                         Accept: 'application/octet-stream',
+                        'User-Agent': 'PermRepo/1.0',
                         ...(validateArweaveId(rootTxId)
                             ? { 'X-AR-IO-Root-Transaction-Id': rootTxId }
                             : {})
@@ -664,9 +689,12 @@ async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchI
     const rootUrl = getValidatedManifestUrl(location.rootTxId, sourceGateway);
     const itemResponse = await fetchImpl(rootUrl, {
         cache: 'no-store',
-        redirect: 'error',
+        redirect: 'follow',
         signal: AbortSignal.timeout(30000),
-        headers: { Range: `bytes=${offset}-${offset + itemSize - 1}` }
+        headers: {
+            Range: `bytes=${offset}-${offset + itemSize - 1}`,
+            'User-Agent': 'PermRepo/1.0'
+        }
     });
     if (itemResponse.status !== 206) {
         try { await itemResponse.body?.cancel(); } catch {}
@@ -686,7 +714,9 @@ async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchI
     return true;
 }
 
+// ✅ LABOTS: loadPreviousManifest ar retry, redirect: 'follow', lielāku timeout
 async function loadPreviousManifest(lastManifest) {
+    // Tukša vērtība nozīmē, ka šim NFT vēl nav veikts backup.
     if (lastManifest === '') {
         return null;
     }
@@ -702,11 +732,22 @@ async function loadPreviousManifest(lastManifest) {
 
     try {
         const manifestUrl = getValidatedManifestUrl(prevManifestId);
-        const response = await fetch(manifestUrl, {
-            cache: 'no-store',
-            redirect: 'error',
-            signal: AbortSignal.timeout(30000)
-        });
+        console.log(`📥 Ielādē iepriekšējo manifestu: ${manifestUrl}`);
+
+        // ✅ Labojumi:
+        // - redirect: 'follow' (ļauj sekot ar.io pāradresācijai uz sandbox apakšdomēnu)
+        // - AbortSignal.timeout(60000) (60s nevis 30s)
+        // - User-Agent un Accept galvenes
+        // - retry 3 mēģinājumi
+        const response = await fetchWithRetry(manifestUrl, {
+            cache: 'default',
+            redirect: 'follow',
+            signal: AbortSignal.timeout(60000),
+            headers: {
+                'User-Agent': 'PermRepo/1.0 (+https://permrepo.app)',
+                'Accept': 'application/json'
+            }
+        }, 3, 'Iepriekšējā manifesta ielāde');
 
         if (!response.ok) {
             throw new Error(`Iepriekšējā manifesta ielāde neizdevās (HTTP ${response.status}).`);
@@ -718,6 +759,7 @@ async function loadPreviousManifest(lastManifest) {
         }
 
         validateManifest(manifest);
+        console.log(`✅ Iepriekšējais manifests ielādēts: ${prevManifestId}`);
         return manifest;
     } catch (error) {
         console.warn('Kļūda, ielādējot iepriekšējo manifestu:', errorMessage(error));
@@ -755,6 +797,7 @@ function getAllowedConnectOrigins() {
         'https://arweave.net',
         'https://ar-io.dev',
         'https://gateway.arweave.net',
+        'https://turbo-gateway.com',
         'https://sepolia.base.org',
         'https://base-sepolia-rpc.publicnode.com',
         'https://upload.services.ar-io.dev',
@@ -972,7 +1015,7 @@ class GitHubRateLimiter {
 
 const githubRateLimiterInstance = new GitHubRateLimiter();
 
-async function fetchWithRetry(url, options, retries = 3) {
+async function fetchWithRetryGitHub(url, options, retries = 3) {
     let lastStatus = null;
 
     for (let attempt = 0; attempt < retries; attempt++) {
@@ -1024,7 +1067,7 @@ function requireGithubSession(req, res) {
 }
 
 async function getGitHubRepository(githubToken, owner, repo) {
-    const response = await fetchWithRetry(
+    const response = await fetchWithRetryGitHub(
         `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`,
         {
             headers: {
@@ -1078,7 +1121,7 @@ async function getGitHubRepositoryById(githubToken, repositoryId) {
         throw new Error('Nederīgs GitHub repo ID.');
     }
 
-    const response = await fetchWithRetry(
+    const response = await fetchWithRetryGitHub(
         `https://api.github.com/repositories/${id}`,
         {
             headers: {
@@ -1121,7 +1164,7 @@ async function getBranchCommitSha(githubToken, owner, repo, branch) {
         `git/ref/heads/` +
         `${encodeURIComponent(branch)}`;
 
-    const response = await fetchWithRetry(url, {
+    const response = await fetchWithRetryGitHub(url, {
         headers: {
             Authorization: `Bearer ${githubToken}`,
             Accept: 'application/vnd.github+json',
@@ -1148,7 +1191,7 @@ async function getGitTree(githubToken, owner, repo, ref) {
         `${encodeURIComponent(repo)}/` +
         `git/trees/${encodedRef}?recursive=1`;
 
-    const response = await fetchWithRetry(url, {
+    const response = await fetchWithRetryGitHub(url, {
         headers: {
             Authorization: `Bearer ${githubToken}`,
             Accept: 'application/vnd.github+json',
@@ -1262,7 +1305,7 @@ async function openRepoArchive(githubToken, owner, repo, metadata) {
         `${encodeURIComponent(repo)}/` +
         `zipball/${encodeURIComponent(commitSha)}`;
 
-    const response = await fetchWithRetry(zipUrl, {
+    const response = await fetchWithRetryGitHub(zipUrl, {
         headers: {
             Authorization: `Bearer ${githubToken}`,
             Accept: 'application/vnd.github+json',
@@ -1483,7 +1526,6 @@ function validateJobTxInput(jobId, txId) {
     }
 }
 
-// ✅ B03 + R01 + P1-1: Papildināta manifesta validācija
 function validateManifest(manifest) {
     if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
         throw new Error('Manifests nav derīgs objekts.');
@@ -1554,7 +1596,6 @@ function validateManifest(manifest) {
         throw new Error('Manifesta archive ID nav derīgs.');
     }
 
-    // ✅ R01: archive.contains un merkleRoot ir obligāti
     if (encryption.version === 1) {
         if (!manifest.archive || typeof manifest.archive !== 'object' || Array.isArray(manifest.archive)) {
             throw new Error('Manifesta archive nav derīgs.');
@@ -1589,14 +1630,12 @@ function validateManifest(manifest) {
             }
         }
 
-        // ✅ P1-1: Pārrēķina Merkle sakni un salīdzina ar manifest.merkleRoot
         const calculatedRoot = calculateArchiveMerkleRoot(manifest.archive.contains);
         if (calculatedRoot.toLowerCase() !== manifest.merkleRoot.toLowerCase()) {
             throw new Error('Manifesta merkleRoot nesakrīt ar aprēķināto no archive.contains.');
         }
     }
 
-    // ✅ B03: deletedFiles validācija
     if (manifest.deletedFiles !== undefined) {
         if (!Array.isArray(manifest.deletedFiles)) {
             throw new Error('Manifesta deletedFiles nav masīvs.');
@@ -1825,7 +1864,7 @@ app.get('/api/github/repos', githubApiLimiter, async (req, res) => {
         const repos = [];
 
         for (let page = 1; page <= MAX_GITHUB_REPO_PAGES; page++) {
-            const response = await fetchWithRetry(
+            const response = await fetchWithRetryGitHub(
                 `https://api.github.com/user/repos?per_page=100&page=${page}&sort=updated&direction=desc`,
                 {
                     headers: {
@@ -2323,7 +2362,6 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
             path => !currentPaths.has(path)
         );
 
-        // ✅ P2-2: Aprēķina TTL pēc statusa
         const job = {
             version: 7,
             jobId,
@@ -2362,7 +2400,6 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
             updatedAt: now
         };
 
-        // ✅ P2-2: Izmanto resolveJobTtl() statusam atbilstošu TTL
         await createJob(jobId, job, resolveJobTtl(job));
 
         await writeNdjson(res, {
@@ -2423,6 +2460,7 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
     } finally {
         if (queueHeartbeat) {
             clearInterval(queueHeartbeat);
+            queueHeartbeat = null;
         }
 
         if (!resourceLease && resourceQueueId) {
@@ -2571,7 +2609,6 @@ app.post('/api/start-zip-upload', backupLimiter, async (req, res) => {
 
             if (job.status === 'prepared') {
                 throwIfLockLost(lockSignal);
-                // ✅ P2-3: Nodod lockToken
                 await updateJob(jobId, {
                     status: 'zip-uploading',
                     zipUploadStartedAt: Date.now(),
@@ -2799,7 +2836,6 @@ app.post('/api/start-manifest-upload', backupLimiter, async (req, res) => {
 
             if (job.status === 'zip-uploaded') {
                 throwIfLockLost(lockSignal);
-                // ✅ P2-3: Nodod lockToken
                 await updateJob(jobId, {
                     status: 'manifest-uploading',
                     manifestUploadStartedAt: Date.now(),
@@ -2865,7 +2901,6 @@ app.post('/api/save-manifest-tx', backupLimiter, async (req, res) => {
                 throw new Error('ZIP transakcija vēl nav saglabāta.');
             }
 
-            // ✅ P1-1: IV pārbaude pret ZIP kontrolpunktu
             const manifestIV = manifest.encryption?.ivs?.[job.zipTxId];
             if (!Array.isArray(manifestIV) || manifestIV.length !== 12) {
                 throw new Error('Manifestā trūkst ZIP IV vai tas nav derīgs.');
@@ -2874,7 +2909,6 @@ app.post('/api/save-manifest-tx', backupLimiter, async (req, res) => {
                 throw new Error('Manifesta ZIP IV nesakrīt ar saglabāto ZIP IV.');
             }
 
-            // ✅ P1-1: Merkle saknes pārbaude pret ZIP kontrolpunktu
             const manifestMerkleRoot = calculateArchiveMerkleRoot(manifest.archive.contains);
             if (manifestMerkleRoot.toLowerCase() !== String(job.zipMerkleRoot).toLowerCase()) {
                 throw new Error('Manifesta archive.contains nesakrīt ar ZIP posmā saglabāto Merkle root.');
@@ -2883,7 +2917,6 @@ app.post('/api/save-manifest-tx', backupLimiter, async (req, res) => {
                 throw new Error('Manifesta merkleRoot nesakrīt ar ZIP posmā saglabāto Merkle root.');
             }
 
-            // ✅ P1-1: Visi job.changedFileMetadata faili ir iekļauti archive.contains
             const changedPaths = new Set((job.changedFileMetadata || []).map(f => f.path));
             const containsPaths = new Set(manifest.archive.contains.map(e => e.path));
             for (const changedPath of changedPaths) {
@@ -3301,8 +3334,6 @@ app.post('/api/complete-backup', backupLimiter, async (req, res) => {
                 throw new Error('Transakcija vēl nav apstiprināta.');
             }
 
-            // ✅ P1-4: Ja transakcija ir iekļauta blokā, bet neizdevās,
-            // atgriežam darbu uz manifest-uploaded, lai varētu mēģināt vēlreiz
             if (receipt.status !== 1) {
                 throwIfLockLost(lockSignal);
                 await updateJob(jobId, {

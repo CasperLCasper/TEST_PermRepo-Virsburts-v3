@@ -160,7 +160,7 @@ test('B07b — tikai tukšs manifests nozīmē pirmo backup; bojāta URI/HTTP/JS
   await assert.rejects(jsonLoader(`ar://${'A'.repeat(43)}`), /backup ir apturēts/);
 });
 
-test('B07c — iepriekšējā manifesta fetch aizliedz HTTP pāradresācijas', async () => {
+test('B07c — iepriekšējā manifesta fetch atļauj pāradresācijas (redirect: follow)', async () => {
   let options;
   const loader = makePreviousManifestLoader({
     fetchImpl: async (_url, suppliedOptions) => {
@@ -169,7 +169,7 @@ test('B07c — iepriekšējā manifesta fetch aizliedz HTTP pāradresācijas', a
     }
   });
   await loader(`ar://${'A'.repeat(43)}`);
-  assert.equal(options.redirect, 'error');
+  assert.equal(options.redirect, 'follow');
 });
 
 // ✅ R01: archive.contains un merkleRoot obligāti

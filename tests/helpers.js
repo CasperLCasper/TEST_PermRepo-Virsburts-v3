@@ -131,6 +131,17 @@ export function makePreviousManifestLoader({ source = backupSource, fetchImpl, v
     return await fakeFetch(url, options);
   };
 
+  // 🔍 DEBUG — īslaicīgi, lai atrastu "Unexpected token 'async'" cēloni
+  // Pēc problēmas atrisināšanas šo bloku var noņemt
+  console.log('\n=== [DEBUG helpers.js] FN GARUMS ===', fn.length);
+  console.log('=== [DEBUG helpers.js] FN PIRMIE 120 ===');
+  console.log(JSON.stringify(fn.slice(0, 120)));
+  console.log('=== [DEBUG helpers.js] FN PĒDĒJIE 200 ===');
+  console.log(JSON.stringify(fn.slice(-200)));
+  console.log('=== [DEBUG helpers.js] FN ASYNC SKAITS ===', (fn.match(/\basync\b/g) || []).length);
+  console.log('=== [DEBUG helpers.js] FN FUNKCIJU SKAITS ===', (fn.match(/\bfunction\b/g) || []).length);
+  console.log('=== [DEBUG helpers.js] END ===\n');
+
   return new Function(
     'validateArweaveId', 'getValidatedManifestUrl', 'fetch', 'fetchWithRetry', 'AbortSignal', 'console', 'errorMessage', 'validateManifest', 'readJsonResponseWithLimit', 'readResponseBytesWithLimit', 'verifyArweaveDataItem', 'MAX_MANIFEST_BYTES',
     `return (${fn});`

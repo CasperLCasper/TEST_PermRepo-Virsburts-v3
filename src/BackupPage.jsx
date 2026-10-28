@@ -114,6 +114,8 @@ function BackupPage() {
     const uploadedManifestRef = useRef({ txId: null, manifest: null });
     const submittedBackupTxHashRef = useRef(null);
     const previousManifestRef = useRef(null);
+    // ✅ P1-3: Saglabā vienu deletion marker un hash visai sesijai
+    const deletionMarkerRef = useRef({ marker: null, hash: null });
 
     const apiJson = useCallback(async (url, options = {}) => {
         const response = await fetch(url, { credentials: 'same-origin', ...options });
@@ -529,7 +531,6 @@ function BackupPage() {
                                     clearRecoveryJournal();
                                     return;
                                 } catch (recoveryError) {
-                                    // ✅ P1-4: Ja blockchain transakcija neizdevās, bet ir retryable
                                     if (recoveryError.retryableBlockchainFailure) {
                                         setStatus(t('blockchain-tx-failed-retry'));
                                         setRecoveryRequired(false);
@@ -613,7 +614,6 @@ function BackupPage() {
                                     zipTxId: jobStatus.zipTxId,
                                     zipIv: jobStatus.zipIv || null,
                                     zipMerkleRoot: jobStatus.zipMerkleRoot || null,
-                                    // ✅ P1-2: Saglabāt zipKeyVerifier
                                     zipKeyVerifier: jobStatus.zipKeyVerifier || null,
                                     manifestTxId: jobStatus.manifestTxId || null,
                                     backupTxHash: jobStatus.backupTxHash || null
@@ -918,7 +918,6 @@ function BackupPage() {
                     const deletedFiles = Object.keys(previousPaths).filter(path => !currentPaths.has(path));
 
                     setCurrentPreviousBackupNumber(Number(metadata.backupCount || 0));
-                    // ✅ P1-3: Ja deletion-only, fileInfo.count rāda 1 (marķieris)
                     const isDeletionOnly = changedFiles.length === 0 && deletedFiles.length > 0;
                     setFileInfo({
                         count: changedFiles.length + (isDeletionOnly ? 1 : 0),
@@ -960,6 +959,7 @@ function BackupPage() {
         clearRecoveryJournal();
         uploadedZipRef.current = { txId: null, iv: null, merkleRoot: null };
         uploadedManifestRef.current = { txId: null, manifest: null };
+        deletionMarkerRef.current = { marker: null, hash: null };
         setRecoveredJobData(null);
         setRecoveryRequired(false);
         window.location.reload();
@@ -980,7 +980,6 @@ function BackupPage() {
             return;
         }
         
-        // ✅ P1-3: Atļaut deletion-only (changedFiles tukšs, bet deletedFiles nav)
         if (changedFilesForUpload.length === 0 && deletedFilesForUpload.length === 0 && !recoveredJobData) {
             setStatus(t('no-changes'));
             setLastStatusData({ type: 'simple', key: 'no-changes' });
@@ -1036,7 +1035,6 @@ function BackupPage() {
             let keyHex;
             
             if (backupCount === 0 && !isRecoveryWithExistingZip) {
-                // ✅ Pirmais backup bez esoša ZIP — ģenerē jaunu Master Key
                 if (!masterKeyRef.current) {
                     const keyBytes = crypto.getRandomValues(new Uint8Array(32));
                     masterKeyRef.current = ethers.hexlify(keyBytes);
@@ -1049,7 +1047,6 @@ function BackupPage() {
                 }
                 keyHex = masterKeyRef.current;
             } else {
-                // ✅ Atkopšana vai nākamais backup — prasa esošo Master Key
                 keyHex = await promptMasterKey();
                 if (!isValidMasterKey(keyHex)) {
                     setError(t('encrypted-required'));
@@ -1057,7 +1054,6 @@ function BackupPage() {
                     return;
                 }
 
-                // ✅ P1-2: Ja ir recoveredJobData ar zipKeyVerifier, pārbaudīt pret to
                 const recoveredVerifier = recoveredJobData?.zipKeyVerifier;
                 if (typeof recoveredVerifier === 'string' && /^0x[0-9a-fA-F]{64}$/.test(recoveredVerifier)) {
                     const enteredVerifier = await createMasterKeyVerifier(keyHex);
@@ -1068,7 +1064,6 @@ function BackupPage() {
                     }
                 }
 
-                // ✅ P1-2: Ja ir iepriekšējais manifests (backupCount > 0), pārbaudīt pret to
                 if (Number(backupCount) > 0) {
                     const previousVerifier = previousManifestRef.current?.encryption?.keyVerifier;
                     if (typeof previousVerifier !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(previousVerifier)) {
@@ -1082,7 +1077,6 @@ function BackupPage() {
                     }
                 }
 
-                // ✅ P1-2: Ja ir recovered ZIP bez verifier, neļaut turpināt
                 if (isRecoveryWithExistingZip && !recoveredVerifier && Number(backupCount) === 0) {
                     throw new Error(t('previous-key-verifier-missing'));
                 }
@@ -1136,12 +1130,30 @@ function BackupPage() {
             let iv = uploadedZipRef.current.iv || recoveredJobData?.zipIv || null;
             let merkleRoot = uploadedZipRef.current.merkleRoot || recoveredJobData?.zipMerkleRoot || null;
 
-            if (zipTxId && (!iv || iv.length !== 12)) {
-                throw new Error(t('recovery-upload-incomplete'));
+            // ✅ P1-3: Ja zipTxId eksistē, bet iv nav, mēģināt iegūt no recovery žurnāla
+            if (zipTxId && (!iv || !Array.isArray(iv) || iv.length !== 12)) {
+                const recoveryJournal = readRecoveryJournal();
+                if (recoveryJournal?.zipIv && Array.isArray(recoveryJournal.zipIv) && recoveryJournal.zipIv.length === 12) {
+                    iv = recoveryJournal.zipIv;
+                } else {
+                    throw new Error(t('recovery-upload-incomplete'));
+                }
             }
 
-            // ✅ P1-2: Saglabāt zipKeyVerifier
             const zipKeyVerifier = await createMasterKeyVerifier(keyHex);
+
+            // ✅ P1-3: Sagatavo deletion marker un hash VIENREIZ visai sesijai
+            const isDeletionOnly = changedFiles.length === 0 && deletedFiles.length > 0;
+            
+            if (isDeletionOnly && !deletionMarkerRef.current.marker) {
+                deletionMarkerRef.current.marker = {
+                    format: 'PermRepo deletions v1',
+                    deletedFiles: deletedFiles,
+                    createdAt: Date.now()
+                };
+                const markerContent = JSON.stringify(deletionMarkerRef.current.marker);
+                deletionMarkerRef.current.hash = ethers.keccak256(ethers.toUtf8Bytes(markerContent)).slice(2);
+            }
 
             if (zipTxId) {
                 if (!updateRecoveryJournal({
@@ -1171,20 +1183,9 @@ function BackupPage() {
 
                 const zip = new JSZip();
 
-                // ✅ P1-3: Ja nav changed failu, bet ir deleted faili, izveido marķieri
-                const isDeletionOnly = changedFiles.length === 0 && deletedFiles.length > 0;
-                let deletionMarker = null;
-                let deletionMarkerHash = null;
-
-                if (isDeletionOnly) {
-                    deletionMarker = {
-                        format: 'PermRepo deletions v1',
-                        deletedFiles: deletedFiles,
-                        createdAt: Date.now()
-                    };
-                    const markerContent = JSON.stringify(deletionMarker);
-                    deletionMarkerHash = ethers.keccak256(ethers.toUtf8Bytes(markerContent)).slice(2);
-                    zip.file('__permrepo_deletions__.json', markerContent);
+                // ✅ P1-3: Izmanto TO PAŠU marker, kas sagatavots iepriekš
+                if (isDeletionOnly && deletionMarkerRef.current.marker) {
+                    zip.file('__permrepo_deletions__.json', JSON.stringify(deletionMarkerRef.current.marker));
                 }
 
                 for (const file of changedFiles) {
@@ -1215,16 +1216,16 @@ function BackupPage() {
                 const encryptedZipData = encrypted.encrypted;
                 iv = encrypted.iv;
 
-                // ✅ P1-3: archive.contains ietver changed failus + marķieri
+                // ✅ P1-3: archive.contains ietver changed failus + TO PAŠU marķieri
                 const archiveContains = changedFiles.map(file => ({
                     path: file.path,
                     hash: file.hash
                 }));
 
-                if (isDeletionOnly) {
+                if (isDeletionOnly && deletionMarkerRef.current.hash) {
                     archiveContains.push({
                         path: '__permrepo_deletions__.json',
-                        hash: deletionMarkerHash
+                        hash: deletionMarkerRef.current.hash
                     });
                 }
 
@@ -1345,7 +1346,6 @@ function BackupPage() {
                             }, 0) + 1;
                         }
 
-                        // ✅ P2-1: Pievienot merkleRoot vēstures ierakstam
                         const previousMerkleRoot = previousManifestRef.current?.merkleRoot;
                         history.push({
                             backupNumber: prevBackupNumber,
@@ -1369,26 +1369,17 @@ function BackupPage() {
                     encryptionIVs[zipTxId] = Array.from(iv);
                 }
 
-                // ✅ P1-3: archive.contains — changed faili + marķieris
+                // ✅ P1-3: archive.contains — changed faili + TO PAŠU marķieri
                 const isDeletionOnly = changedFiles.length === 0 && deletedFiles.length > 0;
                 const archiveContains = changedFiles.map(file => ({
                     path: file.path,
                     hash: file.hash
                 }));
 
-                let deletionMarker = null;
-                let deletionMarkerHash = null;
-                if (isDeletionOnly) {
-                    deletionMarker = {
-                        format: 'PermRepo deletions v1',
-                        deletedFiles: deletedFiles,
-                        createdAt: Date.now()
-                    };
-                    const markerContent = JSON.stringify(deletionMarker);
-                    deletionMarkerHash = ethers.keccak256(ethers.toUtf8Bytes(markerContent)).slice(2);
+                if (isDeletionOnly && deletionMarkerRef.current.hash) {
                     archiveContains.push({
                         path: '__permrepo_deletions__.json',
-                        hash: deletionMarkerHash
+                        hash: deletionMarkerRef.current.hash
                     });
                 }
 
@@ -1421,10 +1412,10 @@ function BackupPage() {
                 }
 
                 // ✅ P1-3: Pievienot marķieri paths
-                if (isDeletionOnly) {
+                if (isDeletionOnly && deletionMarkerRef.current.hash) {
                     manifest.paths['__permrepo_deletions__.json'] = {
                         id: zipTxId,
-                        hash: deletionMarkerHash
+                        hash: deletionMarkerRef.current.hash
                     };
                 }
 
@@ -1623,7 +1614,6 @@ function BackupPage() {
                 redisCompleted = true;
             } catch (completeError) {
                 console.error('Neizdevās paziņot serverim par pabeigšanu:', completeError);
-                // ✅ P1-4: Ja blockchain transakcija neizdevās, bet ir retryable
                 if (completeError.retryableBlockchainFailure) {
                     setStatus(t('blockchain-tx-failed-retry'));
                     setRecoveryRequired(false);
@@ -1728,7 +1718,8 @@ function BackupPage() {
         currentPreviousBackupNumber, currentPreviousEncryptionIVs,
         nftInfo.tokenId, calculateMerkleRoot, calculateArchiveMerkleRoot, encryptData,
         userAddress, recoveredJobData, repositoryId, createMasterKeyVerifier,
-        githubUserId, repositoryFullName, repoStorageKey, clearRecoveryJournal
+        githubUserId, repositoryFullName, repoStorageKey, clearRecoveryJournal,
+        readRecoveryJournal
     ]);
 
     const recoverBackup = useCallback(async () => {
@@ -1774,7 +1765,6 @@ function BackupPage() {
             setLastStatusData({ type: 'success', key: 'backup-complete' });
             setIsWorking(false);
         } catch (e) {
-            // ✅ P1-4: Ja blockchain transakcija neizdevās, bet ir retryable
             if (e.retryableBlockchainFailure) {
                 setStatus(t('blockchain-tx-failed-retry'));
                 setRecoveryRequired(false);

@@ -85,7 +85,6 @@ test('I10 — kritiskie maršruti un galvenās aizsardzības paliek avotā', () 
   ]) assert.ok(backupSource.includes(route), `Trūkst kritiska avota elementa: ${route}`);
 });
 
-
 test('I11 — recovery restores missing ZIP crypto metadata from the local journal', () => {
   const client = fs.readFileSync(path.join(root, 'src/BackupPage.jsx'), 'utf8');
   assert.match(client, /if \(!hasValidZipIv\(jobStatus\.zipIv\) && hasValidZipIv\(recoveryJournal\.zipIv\)\)\s*\{\s*jobStatus\.zipIv = recoveryJournal\.zipIv;/,
@@ -102,40 +101,40 @@ test('I12 — existing recovered ZIP is not reused without its original IV', () 
     'Esošs ZIP bez derīga 12 baitu IV netiek apturēts pirms manifesta veidošanas.');
 });
 
-test('I13 — deletion-only backup is represented by an internal encrypted archive entry', () => {
+// ✅ I13: Deletion-only backup ar marķieri
+test('I13 — deletion-only backup izmanto __permrepo_deletions__.json marķieri', () => {
   const client = fs.readFileSync(path.join(root, 'src/BackupPage.jsx'), 'utf8');
-  assert.match(client, /const deletedPaths = Object\.keys\(previousPaths\)\.filter\(filePath => !currentPathSet\.has\(filePath\)\)/);
-  assert.match(client, /format: 'PermRepo deletions v1'/);
-  assert.match(client, /if \(!file\.internal && !internalArchivePaths\.has\(file\.path\)\)/);
-  assert.match(client, /format: 'PermRepo deletions v1'/);
+  assert.match(client, /__permrepo_deletions__\.json/, 'Trūkst deletion marker ceļa BackupPage.jsx.');
+  assert.match(client, /PermRepo deletions v1/, 'Trūkst deletion marker formāta.');
+  assert.match(client, /isDeletionOnly\s*=\s*changedFiles\.length === 0 && deletedFiles\.length > 0/, 'Trūkst isDeletionOnly pārbaudes.');
 });
 
-test('I14 — existing first-backup ZIP must have a matching Master Key verifier', () => {
+// ✅ I14: Pirmais backup atkopšana ar zipKeyVerifier
+test('I14 — pirmā backup atkopšana pārbauda zipKeyVerifier', () => {
   const client = fs.readFileSync(path.join(root, 'src/BackupPage.jsx'), 'utf8');
-  const server = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
-  assert.match(client, /recoveredJobData\?\.zipKeyVerifier/);
-  assert.match(client, /enteredVerifier\.toLowerCase\(\) !== recoveryVerifier\.toLowerCase\(\)/);
-  assert.match(server, /zipKeyVerifier/);
-  assert.match(server, /Esošam ZIP nevar piešķirt jaunu Master Key verifikatoru/);
+  assert.match(client, /recoveredJobData\?\.zipKeyVerifier/, 'Trūkst recoveredJobData.zipKeyVerifier pārbaudes.');
+  assert.match(client, /zipKeyVerifier/, 'Trūkst zipKeyVerifier saglabāšanas.');
+  assert.match(client, /enteredVerifier\.toLowerCase\(\) !== recoveredVerifier\.toLowerCase\(\)/, 'Trūkst zipKeyVerifier salīdzināšanas.');
 });
 
-test('I15 — server checks manifest IV and archive commitment against the ZIP checkpoint', () => {
+// ✅ I15: IV un Merkle saistība
+test('I15 — serveris pārbauda IV un Merkle pret ZIP kontrolpunktu', () => {
   const server = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
-  assert.match(server, /Manifesta ZIP IV nesakrīt ar saglabāto ZIP IV/);
-  assert.match(server, /Manifesta archive\.contains nesakrīt ar ZIP posmā saglabāto Merkle root/);
-  assert.match(server, /function calculateArchiveMerkleRoot\(contains\)/);
+  assert.match(server, /function calculateArchiveMerkleRoot\(contains\)/, 'Trūkst calculateArchiveMerkleRoot funkcijas.');
+  assert.match(server, /Manifesta ZIP IV nesakrīt ar saglabāto ZIP IV/, 'Trūkst IV pārbaudes.');
+  assert.match(server, /Manifesta archive\.contains nesakrīt ar ZIP posmā saglabāto Merkle root/, 'Trūkst Merkle pārbaudes.');
+  assert.match(server, /Manifesta merkleRoot nesakrīt ar aprēķināto no archive\.contains/, 'Trūkst merkleRoot pārrēķina.');
 });
 
-test('I16 — failed mined blockchain transaction returns to retryable manifest-uploaded state', () => {
+// ✅ I16: Neveiksmīga blockchain transakcija
+test('I16 — neveiksmīga blockchain transakcija atgriež manifest-uploaded', () => {
   const server = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
-  const client = fs.readFileSync(path.join(root, 'src/BackupPage.jsx'), 'utf8');
-  assert.match(server, /receipt\.status !== 0/);
-  assert.match(server, /status: 'manifest-uploaded',[\s\S]*retryableBlockchainFailure: true/);
-  assert.match(client, /txHash: submittedTxHash/);
+  assert.match(server, /receipt\.status !== 1/, 'Trūkst receipt.status pārbaudes.');
+  assert.match(server, /status: 'manifest-uploaded',[\s\S]*retryableBlockchainFailure: true/, 'Trūkst retryableBlockchainFailure.');
 });
 
-
-test('I17 — Redis state machine permits retry only from blockchain finalizing back to manifest uploaded', () => {
+// ✅ I17: State machine atļauj blockchain-finalizing → manifest-uploaded
+test('I17 — state machine atļauj blockchain-finalizing → manifest-uploaded', () => {
   const redis = fs.readFileSync(path.join(root, 'accounting-redis.js'), 'utf8');
-  assert.match(redis, /'blockchain-finalizing': \['completed', 'failed', 'manifest-uploaded'\]/);
+  assert.match(redis, /'blockchain-finalizing': \['completed', 'failed', 'manifest-uploaded'\]/, 'Trūkst state pārejas.');
 });

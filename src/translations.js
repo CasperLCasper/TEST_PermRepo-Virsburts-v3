@@ -66,6 +66,7 @@ export const translations = {
         'backup-session-invalid': 'Backup sesija nav derīga',
         'invalid-file-data': 'Nederīgi faila dati',
         'invalid-upload-id': 'Nederīgs augšupielādes ID',
+        'turbo-upload-failed': 'Turbo augšupielāde neizdevās', // ✅ P1-5
         'unknown-error': 'Nezināma kļūda',
 
         'guide': 'Lietotāja rokasgrāmata',
@@ -181,6 +182,7 @@ export const translations = {
         'backup-session-invalid': 'Backup session is not valid',
         'invalid-file-data': 'Invalid file data',
         'invalid-upload-id': 'Invalid upload ID',
+        'turbo-upload-failed': 'Turbo upload failed', // ✅ P1-5
         'unknown-error': 'Unknown error',
 
         'guide': 'User Guide',
@@ -296,6 +298,7 @@ export const translations = {
         'backup-session-invalid': 'La sekurkopia seanco ne validas',
         'invalid-file-data': 'Nevalidaj dosieraj datumoj',
         'invalid-upload-id': 'Nevalida alŝuta ID',
+        'turbo-upload-failed': 'Turbo alŝuto malsukcesis', // ✅ P1-5
         'unknown-error': 'Nekonata eraro',
 
         'guide': 'Uzanta Gvidilo',

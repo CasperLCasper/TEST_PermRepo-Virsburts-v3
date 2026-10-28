@@ -114,7 +114,6 @@ function BackupPage() {
     const uploadedManifestRef = useRef({ txId: null, manifest: null });
     const submittedBackupTxHashRef = useRef(null);
     const previousManifestRef = useRef(null);
-    // ✅ P1-3: Saglabā vienu deletion marker un hash visai sesijai
     const deletionMarkerRef = useRef({ marker: null, hash: null });
 
     const apiJson = useCallback(async (url, options = {}) => {
@@ -208,7 +207,6 @@ function BackupPage() {
         return ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(['bytes32[]'], [fileHashes]));
     }, []);
 
-    // ✅ P1-3: Merkle root no archive.contains (nevis tikai changedFiles)
     const calculateArchiveMerkleRoot = useCallback((contains) => {
         if (!Array.isArray(contains) || contains.length === 0) {
             return '0x0000000000000000000000000000000000000000000000000000000000000000';
@@ -471,7 +469,6 @@ function BackupPage() {
                                 if (jobStatus.cryptoVersion == null && recoveryJournal.cryptoVersion != null) {
                                     jobStatus.cryptoVersion = recoveryJournal.cryptoVersion;
                                 }
-                                // ✅ P1-2: Atjaunot zipKeyVerifier no recovery žurnāla
                                 if (!jobStatus.zipKeyVerifier && recoveryJournal.zipKeyVerifier) {
                                     jobStatus.zipKeyVerifier = recoveryJournal.zipKeyVerifier;
                                 }
@@ -1130,7 +1127,6 @@ function BackupPage() {
             let iv = uploadedZipRef.current.iv || recoveredJobData?.zipIv || null;
             let merkleRoot = uploadedZipRef.current.merkleRoot || recoveredJobData?.zipMerkleRoot || null;
 
-            // ✅ P1-3: Ja zipTxId eksistē, bet iv nav, mēģināt iegūt no recovery žurnāla
             if (zipTxId && (!iv || !Array.isArray(iv) || iv.length !== 12)) {
                 const recoveryJournal = readRecoveryJournal();
                 if (recoveryJournal?.zipIv && Array.isArray(recoveryJournal.zipIv) && recoveryJournal.zipIv.length === 12) {
@@ -1142,7 +1138,6 @@ function BackupPage() {
 
             const zipKeyVerifier = await createMasterKeyVerifier(keyHex);
 
-            // ✅ P1-3: Sagatavo deletion marker un hash VIENREIZ visai sesijai
             const isDeletionOnly = changedFiles.length === 0 && deletedFiles.length > 0;
             
             if (isDeletionOnly && !deletionMarkerRef.current.marker) {
@@ -1183,7 +1178,6 @@ function BackupPage() {
 
                 const zip = new JSZip();
 
-                // ✅ P1-3: Izmanto TO PAŠU marker, kas sagatavots iepriekš
                 if (isDeletionOnly && deletionMarkerRef.current.marker) {
                     zip.file('__permrepo_deletions__.json', JSON.stringify(deletionMarkerRef.current.marker));
                 }
@@ -1216,7 +1210,6 @@ function BackupPage() {
                 const encryptedZipData = encrypted.encrypted;
                 iv = encrypted.iv;
 
-                // ✅ P1-3: archive.contains ietver changed failus + TO PAŠU marķieri
                 const archiveContains = changedFiles.map(file => ({
                     path: file.path,
                     hash: file.hash
@@ -1229,7 +1222,6 @@ function BackupPage() {
                     });
                 }
 
-                // ✅ P1-3: Merkle root no archive.contains
                 merkleRoot = calculateArchiveMerkleRoot(archiveContains);
 
                 setCurrentIV(iv);
@@ -1258,8 +1250,20 @@ function BackupPage() {
                     chunkingMode: 'auto'
                 });
 
-                if (!isValidManifestId(zipResult?.id)) {
-                    throw new Error(t('invalid-upload-id'));
+                // ✅ P1-5: Stingrāka Turbo atbildes pārbaude
+                if (!zipResult || typeof zipResult !== 'object') {
+                    console.error('Turbo ZIP upload failed (no object):', zipResult);
+                    throw new Error(t('turbo-upload-failed') + ': nav atbildes objekta');
+                }
+
+                if (typeof zipResult.id !== 'string') {
+                    console.error('Turbo ZIP upload failed (no id):', zipResult);
+                    throw new Error(t('turbo-upload-failed') + ': nav id lauka. Atbilde: ' + JSON.stringify(zipResult).substring(0, 200));
+                }
+
+                if (!isValidManifestId(zipResult.id)) {
+                    console.error('Turbo ZIP upload returned invalid id:', zipResult.id);
+                    throw new Error(t('invalid-upload-id') + ': ' + zipResult.id);
                 }
 
                 zipTxId = zipResult.id;
@@ -1369,7 +1373,6 @@ function BackupPage() {
                     encryptionIVs[zipTxId] = Array.from(iv);
                 }
 
-                // ✅ P1-3: archive.contains — changed faili + TO PAŠU marķieri
                 const isDeletionOnly = changedFiles.length === 0 && deletedFiles.length > 0;
                 const archiveContains = changedFiles.map(file => ({
                     path: file.path,
@@ -1383,7 +1386,6 @@ function BackupPage() {
                     });
                 }
 
-                // ✅ P1-3: Merkle root no archive.contains
                 merkleRoot = calculateArchiveMerkleRoot(archiveContains);
 
                 manifest = {
@@ -1411,7 +1413,6 @@ function BackupPage() {
                     manifest.paths[file.path] = { id: zipTxId, hash: file.hash };
                 }
 
-                // ✅ P1-3: Pievienot marķieri paths
                 if (isDeletionOnly && deletionMarkerRef.current.hash) {
                     manifest.paths['__permrepo_deletions__.json'] = {
                         id: zipTxId,
@@ -1453,8 +1454,20 @@ function BackupPage() {
                     chunkingMode: 'auto'
                 });
 
-                if (!isValidManifestId(manifestResult?.id)) {
-                    throw new Error(t('invalid-upload-id'));
+                // ✅ P1-5: Stingrāka Turbo atbildes pārbaude
+                if (!manifestResult || typeof manifestResult !== 'object') {
+                    console.error('Turbo manifest upload failed (no object):', manifestResult);
+                    throw new Error(t('turbo-upload-failed') + ': nav atbildes objekta');
+                }
+
+                if (typeof manifestResult.id !== 'string') {
+                    console.error('Turbo manifest upload failed (no id):', manifestResult);
+                    throw new Error(t('turbo-upload-failed') + ': nav id lauka. Atbilde: ' + JSON.stringify(manifestResult).substring(0, 200));
+                }
+
+                if (!isValidManifestId(manifestResult.id)) {
+                    console.error('Turbo manifest upload returned invalid id:', manifestResult.id);
+                    throw new Error(t('invalid-upload-id') + ': ' + manifestResult.id);
                 }
 
                 manifestTxId = manifestResult.id;

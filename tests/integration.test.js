@@ -101,7 +101,6 @@ test('I12 — existing recovered ZIP is not reused without its original IV', () 
     'Esošs ZIP bez derīga 12 baitu IV netiek apturēts pirms manifesta veidošanas.');
 });
 
-// ✅ I13: Deletion-only backup ar marķieri
 test('I13 — deletion-only backup izmanto __permrepo_deletions__.json marķieri', () => {
   const client = fs.readFileSync(path.join(root, 'src/BackupPage.jsx'), 'utf8');
   assert.match(client, /__permrepo_deletions__\.json/, 'Trūkst deletion marker ceļa BackupPage.jsx.');
@@ -109,7 +108,6 @@ test('I13 — deletion-only backup izmanto __permrepo_deletions__.json marķieri
   assert.match(client, /isDeletionOnly\s*=\s*changedFiles\.length === 0 && deletedFiles\.length > 0/, 'Trūkst isDeletionOnly pārbaudes.');
 });
 
-// ✅ I14: Pirmais backup atkopšana ar zipKeyVerifier
 test('I14 — pirmā backup atkopšana pārbauda zipKeyVerifier', () => {
   const client = fs.readFileSync(path.join(root, 'src/BackupPage.jsx'), 'utf8');
   assert.match(client, /recoveredJobData\?\.zipKeyVerifier/, 'Trūkst recoveredJobData.zipKeyVerifier pārbaudes.');
@@ -117,7 +115,6 @@ test('I14 — pirmā backup atkopšana pārbauda zipKeyVerifier', () => {
   assert.match(client, /enteredVerifier\.toLowerCase\(\) !== recoveredVerifier\.toLowerCase\(\)/, 'Trūkst zipKeyVerifier salīdzināšanas.');
 });
 
-// ✅ I15: IV un Merkle saistība
 test('I15 — serveris pārbauda IV un Merkle pret ZIP kontrolpunktu', () => {
   const server = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
   assert.match(server, /function calculateArchiveMerkleRoot\(contains\)/, 'Trūkst calculateArchiveMerkleRoot funkcijas.');
@@ -126,15 +123,40 @@ test('I15 — serveris pārbauda IV un Merkle pret ZIP kontrolpunktu', () => {
   assert.match(server, /Manifesta merkleRoot nesakrīt ar aprēķināto no archive\.contains/, 'Trūkst merkleRoot pārrēķina.');
 });
 
-// ✅ I16: Neveiksmīga blockchain transakcija
 test('I16 — neveiksmīga blockchain transakcija atgriež manifest-uploaded', () => {
   const server = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
   assert.match(server, /receipt\.status !== 1/, 'Trūkst receipt.status pārbaudes.');
   assert.match(server, /status: 'manifest-uploaded',[\s\S]*retryableBlockchainFailure: true/, 'Trūkst retryableBlockchainFailure.');
 });
 
-// ✅ I17: State machine atļauj blockchain-finalizing → manifest-uploaded
 test('I17 — state machine atļauj blockchain-finalizing → manifest-uploaded', () => {
   const redis = fs.readFileSync(path.join(root, 'accounting-redis.js'), 'utf8');
   assert.match(redis, /'blockchain-finalizing': \['completed', 'failed', 'manifest-uploaded'\]/, 'Trūkst state pārejas.');
+});
+
+// ✅ S01: Lock zaudēšanas testi
+
+test('I18 — withJobLock nodod lockSignal un lockToken (S01)', () => {
+  const start = backupSource.indexOf('async function withJobLock(jobId, fn) {');
+  const end = backupSource.indexOf('\n// -----------------------------------------------------------------------------\n// Redis-backed express-session store.', start);
+  assert.ok(start >= 0 && end > start, 'Nav atrasta withJobLock funkcija.');
+  const lockFn = backupSource.slice(start, end);
+  assert.match(lockFn, /lockLostController\.abort/, 'Lock zaudēšana neizsauc abort.');
+  assert.match(lockFn, /lockSignal:\s*lockLostController\.signal/, 'fn() nesaņem lockSignal.');
+  assert.match(lockFn, /lockToken:\s*token/, 'fn() nesaņem lockToken.');
+});
+
+test('I19 — throwIfLockLost pārtrauc darbu pēc lock zaudēšanas (S01)', () => {
+  assert.match(backupSource, /function throwIfLockLost\(signal\)\s*\{/,
+    'Nav atrasta throwIfLockLost funkcija.');
+  const start = backupSource.indexOf('function throwIfLockLost(signal)');
+  const end = backupSource.indexOf('}', backupSource.indexOf('throw', start));
+  const fn = backupSource.slice(start, end);
+  assert.match(fn, /signal\?\.aborted/, 'throwIfLockLost nepārbauda signal.aborted.');
+  assert.match(fn, /throw/, 'throwIfLockLost nemet kļūdu.');
+});
+
+test('I20 — visi withJobLock izsaucēji izmanto lockSignal (S01)', () => {
+  const lockUsages = backupSource.match(/withJobLock\(jobId,\s*async\s*\(\{\s*lockSignal[^)]*\)/g) || [];
+  assert.ok(lockUsages.length >= 6, `Sagaidīti vismaz 6 withJobLock izsaucēji ar lockSignal, atrasti ${lockUsages.length}.`);
 });

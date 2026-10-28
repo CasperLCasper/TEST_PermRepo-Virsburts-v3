@@ -77,13 +77,16 @@ const VALID_JOB_STATUSES = [
     'failed'
 ];
 
+// ✅ I17: blockchain-finalizing var atgriezties pie manifest-uploaded,
+// ja blockchain transakcija tika iekļauta blokā, bet neizdevās (receipt.status !== 1).
+// Tas ļauj lietotājam mēģināt vēlreiz bez jauna ZIP/manifesta augšupielādes.
 const VALID_TRANSITIONS = {
     'prepared': ['zip-uploading', 'failed'],
     'zip-uploading': ['zip-uploaded', 'failed'],
     'zip-uploaded': ['manifest-uploading', 'failed'],
     'manifest-uploading': ['manifest-uploaded', 'failed'],
     'manifest-uploaded': ['blockchain-finalizing', 'failed'],
-    'blockchain-finalizing': ['completed', 'failed'],
+    'blockchain-finalizing': ['completed', 'failed', 'manifest-uploaded'], // ✅ I17
     'completed': [],
     'failed': [
         'prepared',

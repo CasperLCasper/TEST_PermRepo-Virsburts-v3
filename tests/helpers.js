@@ -110,7 +110,9 @@ export function extractB06Guard(source = backupSource) {
   return new Function('manifest', 'job', `${guard}\nreturn true;`);
 }
 
-// ✅ Atjaunināts: iekļauj fetchWithRetry kā atkarību, lai loadPreviousManifest varētu darboties
+// ✅ Vienkāršots: fetchWithRetry tiek aizstāts ar stub, nevis izvilkts no server.js
+// Tas novērš "Unexpected token 'async'" problēmu, kas rodas, ja new Function
+// ķermenī tiek ievietota async funkcija ar neatbilstošu sintaksi.
 export function makePreviousManifestLoader({ source = backupSource, fetchImpl, validateManifest, warnings = [] } = {}) {
   const fn = extractBetween(source, 'async function loadPreviousManifest(lastManifest) {', '\nconst NFT_ABI');
   const fakeFetch = fetchImpl ?? (async () => new Response(JSON.stringify(validManifest()), { status: 200 }));
@@ -122,14 +124,12 @@ export function makePreviousManifestLoader({ source = backupSource, fetchImpl, v
   const readFn = extractBetween(source, 'async function readJsonResponseWithLimit(response, maxBytes) {', '\nasync function verifyArweaveDataItem');
   const readJsonResponseWithLimit = new Function('readResponseBytesWithLimit', `return (${readFn});`)(readResponseBytesWithLimit);
 
-  // ✅ Izvelk fetchWithRetry no server.js, lai loadPreviousManifest varētu to izsaukt
-  const fetchWithRetryFn = extractBetween(
-    source,
-    "async function fetchWithRetry(url, options, attempts = 3, label = 'Pieprasījums') {",
-    '\nasync function verifyArweaveDataItem'
-  );
   const fakeConsole = { warn: (...args) => warnings.push(args), log: () => {}, error: () => {} };
-  const fetchWithRetry = new Function('fetch', 'console', `return (${fetchWithRetryFn});`)(fakeFetch, fakeConsole);
+
+  // ✅ Vienkāršs fetchWithRetry stub — izsauc fakeFetch vienu reizi
+  const fetchWithRetry = async (url, options) => {
+    return await fakeFetch(url, options);
+  };
 
   return new Function(
     'validateArweaveId', 'getValidatedManifestUrl', 'fetch', 'fetchWithRetry', 'AbortSignal', 'console', 'errorMessage', 'validateManifest', 'readJsonResponseWithLimit', 'readResponseBytesWithLimit', 'verifyArweaveDataItem', 'MAX_MANIFEST_BYTES',

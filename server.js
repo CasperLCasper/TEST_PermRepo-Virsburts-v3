@@ -2198,13 +2198,6 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
             req.body.defaultBranch || repoData.defaultBranch
         );
 
-        if (archiveMetadata.blobs.length === 0) {
-            return res.status(400).json({
-                success: false,
-                error: 'Repozitorijā nav failu.'
-            });
-        }
-
         let maxFileBytes = 0;
 
         for (const blob of archiveMetadata.blobs) {
@@ -2220,13 +2213,31 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
         }
 
         const previousManifest = await loadPreviousManifest(lastManifest);
-        const previousPaths =
+        // Internal deletion metadata is not a GitHub repository file and must
+        // not be treated as a file deleted by the next backup.
+        const previousPaths = Object.create(null);
+        if (
             previousManifest &&
             previousManifest.paths &&
             typeof previousManifest.paths === 'object' &&
             !Array.isArray(previousManifest.paths)
-                ? previousManifest.paths
-                : Object.create(null);
+        ) {
+            for (const [filePath, info] of Object.entries(previousManifest.paths)) {
+                if (filePath !== '__permrepo_deletions__.json') {
+                    previousPaths[filePath] = info;
+                }
+            }
+        }
+
+        // Empty repositories are valid when the previous manifest has files:
+        // the backup client will create a deletion-marker-only ZIP. Reject only
+        // a repository that is empty and has no prior state to back up.
+        if (archiveMetadata.blobs.length === 0 && Object.keys(previousPaths).length === 0) {
+            return res.status(400).json({
+                success: false,
+                error: 'Repozitorijā nav failu un nav iepriekšēja manifesta, ko atjaunināt.'
+            });
+        }
 
         const reservationBytes = backupResourceController.estimateMemoryBytes(maxFileBytes);
         const jobId = crypto.randomUUID();
@@ -2324,6 +2335,10 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
         });
 
         await processRepoArchive(archive, async file => {
+            if (file.path === '__permrepo_deletions__.json') {
+                throw new Error('Faila ceļš __permrepo_deletions__.json ir rezervēts PermRepo dzēšanas marķierim.');
+            }
+
             jobFiles.push({
                 path: file.path,
                 hash: file.hash,
@@ -2613,7 +2628,7 @@ app.post('/api/start-zip-upload', backupLimiter, async (req, res) => {
                     status: 'zip-uploading',
                     zipUploadStartedAt: Date.now(),
                     updatedAt: Date.now()
-                }, JOB_TTL_SECONDS, { lockToken });
+                }, undefined, { lockToken });
             } else if (job.status !== 'zip-uploading') {
                 throw new Error(
                     `Nevar sākt ZIP augšupielādi no statusa: ${job.status}`
@@ -2722,7 +2737,7 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
                     if (Object.keys(missingZipMetadata).length) {
                         throwIfLockLost(lockSignal);
                         missingZipMetadata.updatedAt = Date.now();
-                        await updateJob(jobId, missingZipMetadata, JOB_TTL_SECONDS, { lockToken });
+                        await updateJob(jobId, missingZipMetadata, undefined, { lockToken });
                     }
                     return res.json({ success: true, idempotent: true, status: job.status });
                 }
@@ -2755,7 +2770,7 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
                     recoveredAt: Date.now(),
                     zipUploadedAt: job.zipUploadedAt || Date.now(),
                     updatedAt: Date.now()
-                }, JOB_TTL_SECONDS, { lockToken });
+                }, undefined, { lockToken });
 
                 logSection('🔄 RECOVERED FROM FAILED (ZIP)');
                 logInfo('Job ID', jobId);
@@ -2783,7 +2798,7 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
                 status: 'zip-uploaded',
                 zipUploadedAt: Date.now(),
                 updatedAt: Date.now()
-            }, JOB_TTL_SECONDS, { lockToken });
+            }, undefined, { lockToken });
 
             return res.json({
                 success: true,
@@ -2840,7 +2855,7 @@ app.post('/api/start-manifest-upload', backupLimiter, async (req, res) => {
                     status: 'manifest-uploading',
                     manifestUploadStartedAt: Date.now(),
                     updatedAt: Date.now()
-                }, JOB_TTL_SECONDS, { lockToken });
+                }, undefined, { lockToken });
             } else if (job.status !== 'manifest-uploading') {
                 throw new Error(
                     `Nevar sākt manifesta augšupielādi no statusa: ${job.status}`
@@ -2917,11 +2932,23 @@ app.post('/api/save-manifest-tx', backupLimiter, async (req, res) => {
                 throw new Error('Manifesta merkleRoot nesakrīt ar ZIP posmā saglabāto Merkle root.');
             }
 
+            const jobDeletedFiles = Array.isArray(job.deletedFiles) ? job.deletedFiles : [];
+            const manifestDeletedFiles = Array.isArray(manifest.deletedFiles) ? manifest.deletedFiles : [];
+            const normalizePaths = paths => paths.map(String).sort();
+            if (JSON.stringify(normalizePaths(jobDeletedFiles)) !== JSON.stringify(normalizePaths(manifestDeletedFiles))) {
+                throw new Error('Manifesta deletedFiles nesakrīt ar rezerves kopijas darba dzēsto failu sarakstu.');
+            }
+
             const changedPaths = new Set((job.changedFileMetadata || []).map(f => f.path));
             const containsPaths = new Set(manifest.archive.contains.map(e => e.path));
             for (const changedPath of changedPaths) {
                 if (!containsPaths.has(changedPath)) {
                     throw new Error(`Manifesta archive.contains trūkst ZIP faila: ${changedPath}`);
+                }
+                const pathInfo = manifest.paths[changedPath];
+                const pathZipId = pathInfo && (pathInfo.zipId || pathInfo.id);
+                if (pathZipId !== job.zipTxId) {
+                    throw new Error(`Manifesta faila ${changedPath} ZIP ID nesakrīt ar pašreizējā darba ZIP transakciju.`);
                 }
             }
 
@@ -2962,7 +2989,7 @@ app.post('/api/save-manifest-tx', backupLimiter, async (req, res) => {
                     recoveredAt: Date.now(),
                     manifestUploadedAt: Date.now(),
                     updatedAt: Date.now()
-                }, JOB_TTL_SECONDS, { lockToken });
+                }, undefined, { lockToken });
 
                 logSection('🔄 RECOVERED FROM FAILED (MANIFEST)');
                 logInfo('Job ID', jobId);
@@ -2994,7 +3021,7 @@ app.post('/api/save-manifest-tx', backupLimiter, async (req, res) => {
                 status: 'manifest-uploaded',
                 manifestUploadedAt: Date.now(),
                 updatedAt: Date.now()
-            }, JOB_TTL_SECONDS, { lockToken });
+            }, undefined, { lockToken });
 
             return res.json({
                 success: true,
@@ -3163,7 +3190,7 @@ app.post('/api/start-blockchain-finalize', backupLimiter, async (req, res) => {
                 deadline: String(deadline),
                 blockchainFinalizeStartedAt: Date.now(),
                 updatedAt: Date.now()
-            }, JOB_TTL_SECONDS, { lockToken });
+            }, undefined, { lockToken });
 
             return res.json({
                 success: true,
@@ -3241,7 +3268,7 @@ app.post('/api/save-backup-tx', backupLimiter, async (req, res) => {
                 backupTxHash: txHash,
                 backupTxSubmittedAt: Date.now(),
                 updatedAt: Date.now()
-            }, JOB_TTL_SECONDS, { lockToken });
+            }, undefined, { lockToken });
 
             return res.json({
                 success: true,
@@ -3344,7 +3371,7 @@ app.post('/api/complete-backup', backupLimiter, async (req, res) => {
                     error: 'Blockchain transakcija neizdevās — var mēģināt vēlreiz.',
                     failedAt: Date.now(),
                     updatedAt: Date.now()
-                }, JOB_TTL_SECONDS, { lockToken });
+                }, undefined, { lockToken });
 
                 logSection('⚠️ BLOCKCHAIN TRANSACTION FAILED');
                 logInfo('Job ID', jobId);
@@ -3414,7 +3441,7 @@ app.post('/api/complete-backup', backupLimiter, async (req, res) => {
                 completionTxHash: txHash,
                 completedAt: Date.now(),
                 updatedAt: Date.now()
-            }, JOB_TTL_SECONDS, { lockToken });
+            }, undefined, { lockToken });
 
             logSection('✅ BACKUP COMPLETED');
             logInfo('Job ID', jobId);
@@ -3502,7 +3529,7 @@ app.post('/api/fail-backup', backupLimiter, async (req, res) => {
                 error: String(jobError || 'Unknown error').substring(0, 500),
                 failedAt: Date.now(),
                 updatedAt: Date.now()
-            }, JOB_TTL_SECONDS, { lockToken });
+            }, undefined, { lockToken });
 
             logSection('⚠️ BACKUP FAILED');
             logInfo('Job ID', jobId);

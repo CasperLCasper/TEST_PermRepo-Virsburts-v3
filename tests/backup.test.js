@@ -255,3 +255,28 @@ test('B09d — deletedFiles ar pārāk garu ceļu tiek noraidīts (B03)', () => 
   m.deletedFiles = ['x'.repeat(1001)];
   assert.throws(() => validateManifest(m));
 });
+
+
+// Production-readiness evidence for A-04 / A-06.
+test('A06 — pašreizējais Merkle algoritms neiekļauj faila ceļu lapas hash aprēķinā', () => {
+  const start = backupSource.indexOf('function calculateArchiveMerkleRoot(contains) {');
+  const end = backupSource.indexOf('\nfunction getValidatedManifestUrl', start);
+  assert.ok(start >= 0 && end > start, 'Nav atrasta servera Merkle funkcija.');
+  const fn = backupSource.slice(start, end);
+  const leafStart = fn.indexOf('const hashes = contains.map');
+  const leafEnd = fn.indexOf(');', leafStart);
+  assert.ok(leafStart >= 0 && leafEnd > leafStart, 'Nav atrasta Merkle lapu veidošana.');
+  const leafExpression = fn.slice(leafStart, leafEnd);
+  assert.match(leafExpression, /entry\.hash/);
+  assert.doesNotMatch(leafExpression, /entry\.path/,
+    'Šis tests dokumentē esošā v1 algoritma ierobežojumu: path nav iekļauts Merkle lapā.');
+  const first = calculateArchiveMerkleRoot([
+    { path: 'docs/a.txt', hash: 'a'.repeat(64) },
+    { path: 'docs/b.txt', hash: 'b'.repeat(64) }
+  ]);
+  const renamed = calculateArchiveMerkleRoot([
+    { path: 'private/renamed-a.txt', hash: 'a'.repeat(64) },
+    { path: 'private/renamed-b.txt', hash: 'b'.repeat(64) }
+  ]);
+  assert.equal(first, renamed, 'Ceļu maiņa nedrīkst mainīt pašreizējo v1 Merkle root — tas pierāda A-06.');
+});

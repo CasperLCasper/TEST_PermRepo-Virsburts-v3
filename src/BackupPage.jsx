@@ -886,7 +886,13 @@ function BackupPage() {
                         const prevManifest = await manifestResponse.json();
                         previousManifestRef.current = prevManifest;
                         if (prevManifest && typeof prevManifest.paths === 'object' && !Array.isArray(prevManifest.paths)) {
-                            previousPaths = Object.assign(Object.create(null), prevManifest.paths);
+                            previousPaths = Object.create(null);
+                            for (const [filePath, info] of Object.entries(prevManifest.paths)) {
+                                // This is internal backup metadata, not a repository file.
+                                if (filePath !== '__permrepo_deletions__.json') {
+                                    previousPaths[filePath] = info;
+                                }
+                            }
                             setCurrentUnchangedFiles(previousPaths);
                         }
                         if (Array.isArray(prevManifest?.history)) {

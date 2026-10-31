@@ -358,3 +358,12 @@ test('P26 — ZIP atslēgas verifikators tiek saglabāts Redis job un atgriezts 
   assert.match(server, /zipKeyVerifier \? \{ zipKeyVerifier \} : \{\}/);
   assert.match(client, /cryptoVersion: 1, zipKeyVerifier/);
 });
+
+
+test('P27 — galvenā lapa atrod nepabeigtu backup Redis arī bez localStorage jobId', () => {
+  const app = read('src/App.jsx');
+  assert.match(app, /\/api\/recover-job\?repositoryId=/, 'Galvenā lapa neveic Redis job meklēšanu.');
+  assert.match(app, /walletAddress=\$\{encodeURIComponent\(userAddress\)\}/, 'Redis meklēšanai netiek izmantots pieslēgtais maks.');
+  assert.match(app, /localStorage\.setItem\(`permrepo-job-\$\{repoKey\}`, storedJobId\)/, 'Atrastais Redis jobId netiek saglabāts kā lokāls rezerves kontrolpunkts.');
+  assert.match(app, /jobStatus\.zipTxId \|\| jobStatus\.manifestTxId \|\| jobStatus\.backupTxHash/, 'Nepabeigts backup netiek atpazīts pēc ZIP/manifesta/transakcijas kontrolpunkta.');
+});

@@ -21,6 +21,7 @@ import {
     getRedis,
     createJob,
     getJob,
+    findJobByOwner,
     updateJob,
     resolveJobTtl,
     acquireJobLock,
@@ -2133,7 +2134,7 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
         assertSameOrigin(req);
         if (!requireGithubSession(req, res)) return;
 
-        const { repositoryId, walletAddress } = req.body;
+        const { repositoryId, walletAddress, recoveryJobId: requestedRecoveryJobId } = req.body;
         const githubToken = req.session.githubToken;
         const githubUser = req.session.githubUser;
         const githubUserId = String(req.session.githubUserId);
@@ -2240,7 +2241,25 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
         }
 
         const reservationBytes = backupResourceController.estimateMemoryBytes(maxFileBytes);
-        const jobId = crypto.randomUUID();
+        if (requestedRecoveryJobId != null && !validateJobId(requestedRecoveryJobId)) {
+            return res.status(400).json({ success: false, error: 'Nederīgs atkopšanas job ID.' });
+        }
+        const jobId = requestedRecoveryJobId || crypto.randomUUID();
+        if (requestedRecoveryJobId) {
+            const existingRecoveryJob = await getJob(requestedRecoveryJobId);
+            if (existingRecoveryJob) {
+                await verifyJobAuthorization(req, existingRecoveryJob);
+                if (String(existingRecoveryJob.githubRepositoryId) !== String(id) ||
+                    String(existingRecoveryJob.walletAddress).toLowerCase() !== normalizedWallet.toLowerCase()) {
+                    return res.status(403).json({ success: false, error: 'Atkopšanas job neatbilst šim repozitorijam vai makam.' });
+                }
+                return res.status(409).json({
+                    success: false,
+                    error: 'Atkopšanas job jau eksistē Redis. Atjauno to pēc esošā job ID.',
+                    jobId: requestedRecoveryJobId
+                });
+            }
+        }
         const now = Date.now();
 
         res.status(200);
@@ -2500,6 +2519,44 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
 });
 
 // =============================================================================
+// Redis-first recovery lookup — does not depend on localStorage/jobId.
+// =============================================================================
+
+app.get('/api/recover-job', async (req, res) => {
+    try {
+        if (!requireGithubSession(req, res)) return;
+
+        const repositoryId = String(req.query.repositoryId || '');
+        const walletAddress = safeWallet(req.query.walletAddress);
+        if (!/^\d+$/.test(repositoryId) || !walletAddress) {
+            return res.status(400).json({ success: false, error: 'Nederīgs repozitorijs vai maka adrese.' });
+        }
+
+        const job = await findJobByOwner(
+            String(req.session.githubUserId),
+            repositoryId,
+            walletAddress
+        );
+
+        if (!job) {
+            return res.status(404).json({ success: false, error: 'Redis nav atrasts nepabeigts backup job.' });
+        }
+
+        const authorizedWallet = await verifyJobAuthorization(req, job);
+        if (String(job.githubRepositoryId) !== repositoryId ||
+            authorizedWallet.toLowerCase() !== walletAddress.toLowerCase()) {
+            return res.status(404).json({ success: false, error: 'Redis atrastais job neatbilst pieprasītajam repozitorijam vai makam.' });
+        }
+
+        await verifyJobNFTAuthorization({ ...job, walletAddress: authorizedWallet });
+        return res.json({ success: true, jobId: job.jobId, status: job.status });
+    } catch (error) {
+        console.error('Redis-first backup recovery lookup failed:', error);
+        return res.status(500).json({ success: false, error: errorMessage(error) });
+    }
+});
+
+// =============================================================================
 // Job status — browser reload recovery
 // =============================================================================
 
@@ -2561,6 +2618,7 @@ app.get('/api/job-status', async (req, res) => {
             cryptoVersion: job.cryptoVersion == null ? null : Number(job.cryptoVersion),
             zipIv: job.zipIv || null,
             zipMerkleRoot: job.zipMerkleRoot || null,
+            zipKeyVerifier: job.zipKeyVerifier || null,
             manifestTxId: job.manifestTxId || null,
             backupCount,
             backupNumber: job.backupNumber || null,
@@ -2653,7 +2711,7 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
         assertSameOrigin(req);
         if (!requireGithubSession(req, res)) return;
 
-        const { jobId, zipTxId, iv, merkleRoot, cryptoVersion } = req.body;
+        const { jobId, zipTxId, iv, merkleRoot, cryptoVersion, zipKeyVerifier } = req.body;
 
         validateJobTxInput(jobId, zipTxId);
         if (cryptoVersion !== 1) {
@@ -2661,6 +2719,10 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
                 success: false,
                 error: 'Neatbalstīta ZIP šifrēšanas versija. Atjaunini backup platformu.'
             });
+        }
+        if (zipKeyVerifier != null &&
+            (typeof zipKeyVerifier !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(zipKeyVerifier))) {
+            return res.status(400).json({ success: false, error: 'Nederīgs ZIP atslēgas verifikators.' });
         }
 
         let normalizedIV = null;
@@ -2734,6 +2796,7 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
                     const missingZipMetadata = {};
                     if (!job.zipIv && normalizedIV) missingZipMetadata.zipIv = normalizedIV;
                     if (!job.zipMerkleRoot && normalizedMerkleRoot) missingZipMetadata.zipMerkleRoot = normalizedMerkleRoot;
+                    if (!job.zipKeyVerifier && zipKeyVerifier) missingZipMetadata.zipKeyVerifier = zipKeyVerifier;
                     if (Object.keys(missingZipMetadata).length) {
                         throwIfLockLost(lockSignal);
                         missingZipMetadata.updatedAt = Date.now();
@@ -2763,6 +2826,7 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
                     cryptoVersion: 1,
                     zipIv: normalizedIV,
                     zipMerkleRoot: normalizedMerkleRoot,
+                    ...(zipKeyVerifier ? { zipKeyVerifier } : {}),
                     status: recoveredStatus,
                     error: null,
                     failedAt: null,
@@ -2795,6 +2859,7 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
                 cryptoVersion: 1,
                 zipIv: normalizedIV,
                 zipMerkleRoot: normalizedMerkleRoot,
+                ...(zipKeyVerifier ? { zipKeyVerifier } : {}),
                 status: 'zip-uploaded',
                 zipUploadedAt: Date.now(),
                 updatedAt: Date.now()

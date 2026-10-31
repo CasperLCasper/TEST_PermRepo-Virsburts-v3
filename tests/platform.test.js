@@ -333,3 +333,28 @@ test('P24 — restore.js prasa archive.contains un merkleRoot (R01)', { skip: !h
   assert.match(source, /calculatedRoot\.toLowerCase\(\) !== manifest\.merkleRoot\.toLowerCase\(\)/,
     'restore.js nepārbauda merkleRoot atbilstību archive.contains.');
 });
+
+
+test('P25 — backup atkopšana vispirms atrod job Redis pēc lietotāja, repozitorija un maka', () => {
+  const server = read('server.js');
+  const redis = read('accounting-redis.js');
+  const client = read('src/BackupPage.jsx');
+
+  assert.match(server, /app\.get\('\/api\/recover-job'/);
+  assert.match(server, /findJobByOwner\(/);
+  assert.match(redis, /permrepo:job-owner:/);
+  assert.match(redis, /export async function findJobByOwner/);
+  assert.match(client, /\/api\/recover-job\?repositoryId=/);
+  assert.match(client, /recoveryJobIdForPrepare = storedJobId/);
+  assert.match(client, /recoveryJobId: recoveryJobIdForPrepare/);
+});
+
+test('P26 — ZIP atslēgas verifikators tiek saglabāts Redis job un atgriezts atkopšanas atbildē', () => {
+  const server = read('server.js');
+  const client = read('src/BackupPage.jsx');
+
+  assert.match(server, /zipKeyVerifier: job\.zipKeyVerifier \|\| null/);
+  assert.match(server, /cryptoVersion, zipKeyVerifier \} = req\.body/);
+  assert.match(server, /zipKeyVerifier \? \{ zipKeyVerifier \} : \{\}/);
+  assert.match(client, /cryptoVersion: 1, zipKeyVerifier/);
+});

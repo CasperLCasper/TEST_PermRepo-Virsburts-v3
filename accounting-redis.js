@@ -23,6 +23,64 @@ function jobLockKey(jobId) {
     return `permrepo:joblock:${jobId}`;
 }
 
+function jobOwnerLookupKey(job) {
+    const githubUserId = String(job?.githubUserId || '');
+    const repositoryId = String(job?.githubRepositoryId || '');
+    const walletAddress = String(job?.walletAddress || '').toLowerCase();
+
+    if (!/^\d+$/.test(githubUserId) || !/^\d+$/.test(repositoryId) ||
+        !/^0x[0-9a-f]{40}$/.test(walletAddress)) {
+        return null;
+    }
+
+    return `permrepo:job-owner:${githubUserId}:${repositoryId}:${walletAddress}`;
+}
+
+async function writeJobOwnerLookup(client, jobId, job, ttl) {
+    const key = jobOwnerLookupKey(job);
+    if (!key) return;
+
+    if (job.status === 'completed') {
+        const current = await client.get(key);
+        if (String(current || '') === String(jobId)) await client.del(key);
+        return;
+    }
+
+    if (ttl > 0) {
+        await client.set(key, jobId, { ex: ttl });
+    } else {
+        await client.set(key, jobId);
+    }
+}
+
+export async function findJobByOwner(githubUserId, repositoryId, walletAddress) {
+    const client = requireRedis();
+    const userId = String(githubUserId || '');
+    const repoId = String(repositoryId || '');
+    const wallet = String(walletAddress || '').toLowerCase();
+
+    if (!/^\d+$/.test(userId) || !/^\d+$/.test(repoId) ||
+        !/^0x[0-9a-f]{40}$/.test(wallet)) {
+        throw new Error('Nederīgi backup darba meklēšanas parametri.');
+    }
+
+    try {
+        const jobId = await client.get(`permrepo:job-owner:${userId}:${repoId}:${wallet}`);
+        if (!jobId) return null;
+
+        const job = await getJob(String(jobId));
+        if (!job || job.status === 'completed') {
+            await client.del(`permrepo:job-owner:${userId}:${repoId}:${wallet}`);
+            return null;
+        }
+
+        return job;
+    } catch (error) {
+        console.error('Redis job owner lookup kļūda:', error);
+        throw new Error('Backup darba meklēšana Redis neizdevās.');
+    }
+}
+
 // -----------------------------------------------------------------------------
 // TTL noteikšana pēc job stāvokļa
 // -----------------------------------------------------------------------------
@@ -296,6 +354,13 @@ export async function createJob(
             );
         }
 
+        try {
+            await writeJobOwnerLookup(client, jobId, stored, ttl);
+        } catch (indexError) {
+            // The job record is authoritative; the owner index is a recovery
+            // accelerator and may be rebuilt when the job is next read.
+            console.error('Redis job owner lookup izveide neizdevās:', indexError);
+        }
         return true;
     } catch (error) {
         console.error(
@@ -329,13 +394,19 @@ export async function getJob(jobId) {
             return null;
         }
 
-        if (typeof value === 'object') {
-            return value;
+        const job = typeof value === 'object'
+            ? value
+            : JSON.parse(String(value));
+
+        // Backfill the owner index for jobs created before Redis-first recovery
+        // was deployed. The job record remains the source of truth.
+        try {
+            await writeJobOwnerLookup(client, jobId, job, resolveJobTtl(job));
+        } catch (indexError) {
+            console.error('Redis job owner lookup backfill neizdevās:', indexError);
         }
 
-        return JSON.parse(
-            String(value)
-        );
+        return job;
     } catch (error) {
         console.error(
             'Redis getJob kļūda:',
@@ -447,6 +518,11 @@ export async function updateJob(
             }
 
             if (result === 1) {
+                try {
+                    await writeJobOwnerLookup(client, jobId, next, ttl);
+                } catch (indexError) {
+                    console.error('Redis job owner lookup atjaunošana neizdevās:', indexError);
+                }
                 return next;
             }
 

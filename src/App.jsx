@@ -86,7 +86,8 @@ function App() {
         }
     }, [apiJson]);
 
-    // ✅ Nepabeigta backupa pārbaude
+    // Nepabeigta backup pārbaude: vispirms meklējam Redis pēc lietotāja,
+    // repozitorija un maka. localStorage jobId ir tikai rezerves ceļš.
     const checkUnfinishedBackup = useCallback(async (repoName) => {
         if (!repoName) {
             setUnfinishedBackup(null);
@@ -94,8 +95,36 @@ function App() {
         }
 
         const selectedRepo = reposData.find(repo => repo.name === repoName);
-        const repoKey = selectedRepo?.id != null ? String(selectedRepo.id) : repoName;
-        const storedJobId = localStorage.getItem(`permrepo-job-${repoKey}`);
+        if (!selectedRepo || selectedRepo.id == null || !userAddress) {
+            setUnfinishedBackup(null);
+            return;
+        }
+
+        const repoKey = String(selectedRepo.id);
+        let storedJobId = localStorage.getItem(`permrepo-job-${repoKey}`);
+        let redisJobFound = false;
+
+        try {
+            const redisRecovery = await apiJson(
+                `/api/recover-job?repositoryId=${encodeURIComponent(selectedRepo.id)}&walletAddress=${encodeURIComponent(userAddress)}`
+            );
+            if (redisRecovery?.success && redisRecovery.jobId) {
+                storedJobId = redisRecovery.jobId;
+                redisJobFound = true;
+                localStorage.setItem(`permrepo-job-${repoKey}`, storedJobId);
+            }
+        } catch (lookupError) {
+            // 404 nozīmē, ka Redis nav nepabeigta job; citām kļūdām
+            // izmantojam localStorage tikai kā rezerves atkopšanas norādi.
+            if (lookupError.status !== 404) {
+                console.error('Neizdevās meklēt nepabeigtu backup Redis:', lookupError);
+                if (!storedJobId) {
+                    setUnfinishedBackup(null);
+                    setError(getSafeErrorMessage(lookupError, t));
+                    return;
+                }
+            }
+        }
 
         if (!storedJobId) {
             setUnfinishedBackup(null);
@@ -106,13 +135,16 @@ function App() {
             const jobStatus = await apiJson(`/api/job-status?jobId=${encodeURIComponent(storedJobId)}`);
 
             if (!jobStatus.success) {
+                if (redisJobFound) {
+                    setUnfinishedBackup(null);
+                    return;
+                }
                 localStorage.removeItem(`permrepo-job-${repoKey}`);
                 localStorage.removeItem(`permrepo-backup-tx-${repoKey}`);
                 setUnfinishedBackup(null);
                 return;
             }
 
-            // ✅ Ja completed → nav nepabeigts
             if (jobStatus.status === 'completed') {
                 localStorage.removeItem(`permrepo-job-${repoKey}`);
                 localStorage.removeItem(`permrepo-backup-tx-${repoKey}`);
@@ -120,35 +152,35 @@ function App() {
                 return;
             }
 
-            // ✅ Ja ir zipTxId → nepabeigts
-            if (jobStatus.zipTxId) {
+            // Nepabeigtu backup atpazīstam pēc jebkura jau saglabāta
+            // augšupielādes kontrolpunkta, ne tikai pēc ZIP ID.
+            if (jobStatus.zipTxId || jobStatus.manifestTxId || jobStatus.backupTxHash) {
                 setUnfinishedBackup({
                     jobId: storedJobId,
-                    repoName: repoName,
-                    zipTxId: jobStatus.zipTxId,
+                    repoName,
+                    zipTxId: jobStatus.zipTxId || null,
+                    manifestTxId: jobStatus.manifestTxId || null,
+                    backupTxHash: jobStatus.backupTxHash || null,
                     status: jobStatus.status
                 });
                 return;
             }
 
-            // ✅ Nekas nav augšupielādēts → nav nepabeigts
             localStorage.removeItem(`permrepo-job-${repoKey}`);
             localStorage.removeItem(`permrepo-backup-tx-${repoKey}`);
             setUnfinishedBackup(null);
-        } catch (e) {
-            if (e.status === 404) {
-                // Job tiešām nav atrasts — dzēšam localStorage
+        } catch (statusError) {
+            if (statusError.status === 404 && !redisJobFound) {
                 localStorage.removeItem(`permrepo-job-${repoKey}`);
                 localStorage.removeItem(`permrepo-backup-tx-${repoKey}`);
                 setUnfinishedBackup(null);
             } else {
-                // Īslaicīga kļūda — NEDZĒŠAM localStorage
-                console.error('Neizdevās pārbaudīt backup job:', e);
-                // Nezīmējam unfinishedBackup, jo nezinām statusu
+                console.error('Neizdevās pārbaudīt backup job:', statusError);
+                setError(getSafeErrorMessage(statusError, t));
                 setUnfinishedBackup(null);
             }
         }
-    }, [apiJson, reposData]);
+    }, [apiJson, reposData, userAddress, t]);
 
     // ✅ Kad lietotājs izvēlas repo → pārbauda nepabeigtu backupu
     useEffect(() => {

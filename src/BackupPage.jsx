@@ -445,8 +445,45 @@ function BackupPage() {
                 }
 
                 const recoveryJournal = readRecoveryJournal();
-                const storedJobId = localStorage.getItem(`permrepo-job-${repoStorageKey}`) || recoveryJournal?.jobId || null;
-                const storedBackupTx = localStorage.getItem(`permrepo-backup-tx-${repoStorageKey}`) || recoveryJournal?.backupTxHash || null;
+                const localStoredJobId = localStorage.getItem(`permrepo-job-${repoStorageKey}`) || recoveryJournal?.jobId || null;
+                let storedJobId = localStoredJobId;
+                const localStoredBackupTx = localStorage.getItem(`permrepo-backup-tx-${repoStorageKey}`) || recoveryJournal?.backupTxHash || null;
+                let storedBackupTx = localStoredBackupTx;
+                let recoveryJobIdForPrepare = null;
+
+                // Redis is the primary source. localStorage is consulted only as
+                // a fallback when Redis has no indexed job for this owner/repo/wallet.
+                try {
+                    const redisRecovery = await apiJson(
+                        `/api/recover-job?repositoryId=${encodeURIComponent(repositoryId)}&walletAddress=${encodeURIComponent(currentAddress)}`
+                    );
+                    if (redisRecovery?.success && redisRecovery.jobId) {
+                        storedJobId = redisRecovery.jobId;
+                        if (recoveryJournal?.jobId && recoveryJournal.jobId !== storedJobId) {
+                            // Do not mix local checkpoints belonging to a different job.
+                            clearRecoveryJournal();
+                            localStorage.removeItem(`permrepo-backup-tx-${repoStorageKey}`);
+                            storedBackupTx = null;
+                        } else if (localStoredJobId && localStoredJobId !== storedJobId) {
+                            localStorage.removeItem(`permrepo-backup-tx-${repoStorageKey}`);
+                            storedBackupTx = null;
+                        }
+                        localStorage.setItem(`permrepo-job-${repoStorageKey}`, storedJobId);
+                        updateRecoveryJournal({
+                            jobId: storedJobId,
+                            repositoryId: String(repositoryId),
+                            walletAddress: currentAddress
+                        });
+                    }
+                } catch (redisLookupError) {
+                    if (redisLookupError.status !== 404) {
+                        console.error('Neizdevās meklēt backup job Redis:', redisLookupError);
+                        setError(getSafeErrorMessage(redisLookupError, t));
+                        setFileInfo({ count: 0, sizeText: '', loading: false });
+                        return;
+                    }
+                }
+
                 let shouldStartNewBackup = !storedJobId;
 
                 if (storedJobId) {
@@ -454,7 +491,7 @@ function BackupPage() {
                         const jobStatus = await apiJson(`/api/job-status?jobId=${encodeURIComponent(storedJobId)}`);
 
                         if (jobStatus.success) {
-                            if (recoveryJournal) {
+                            if (recoveryJournal && recoveryJournal.jobId === storedJobId) {
                                 if (!jobStatus.zipTxId && recoveryJournal.zipTxId) {
                                     jobStatus.zipTxId = recoveryJournal.zipTxId;
                                 }
@@ -692,8 +729,8 @@ function BackupPage() {
 
                                 const hasAnyUploadedArtifact = Boolean(
                                     jobStatus.zipTxId || jobStatus.manifestTxId || jobStatus.backupTxHash ||
-                                    storedBackupTx || recoveryJournal?.zipTxId || recoveryJournal?.manifestTxId ||
-                                    recoveryJournal?.backupTxHash
+                                    storedBackupTx || (recoveryJournal?.jobId === storedJobId && (recoveryJournal?.zipTxId || recoveryJournal?.manifestTxId ||
+                                    recoveryJournal?.backupTxHash))
                                 );
                                 if (['failed', 'prepared', 'zip-uploading'].includes(jobStatus.status) && !hasAnyUploadedArtifact) {
                                     setRecoveredJobData({ ...jobStatus, freshStartRequired: true });
@@ -728,17 +765,17 @@ function BackupPage() {
                                 return;
                             }
 
-                            localStorage.removeItem(`permrepo-job-${repoStorageKey}`);
-                            localStorage.removeItem(`permrepo-backup-tx-${repoStorageKey}`);
-                            clearRecoveryJournal();
+                            // Redis has no record for this locally journaled ID.
+                            // Re-run preparation with the same ID; do not discard
+                            // the recovery pointer before the server recreates it.
+                            recoveryJobIdForPrepare = storedJobId;
                             shouldStartNewBackup = true;
                         }
                     } catch (recoveryError) {
                         if (recoveryError.status === 404) {
+                            const journalMatchesJob = recoveryJournal?.jobId === storedJobId;
                             const journalHasUploadedData = Boolean(
-                                recoveryJournal?.zipTxId ||
-                                recoveryJournal?.manifestTxId ||
-                                recoveryJournal?.backupTxHash ||
+                                (journalMatchesJob && (recoveryJournal?.zipTxId || recoveryJournal?.manifestTxId || recoveryJournal?.backupTxHash)) ||
                                 storedBackupTx
                             );
                             if (journalHasUploadedData) {
@@ -749,9 +786,9 @@ function BackupPage() {
                                 setFileInfo({ count: 0, sizeText: '', loading: false });
                                 return;
                             }
-                            localStorage.removeItem(`permrepo-job-${repoStorageKey}`);
-                            localStorage.removeItem(`permrepo-backup-tx-${repoStorageKey}`);
-                            clearRecoveryJournal();
+                            // Keep the local journal as a fallback checkpoint and
+                            // recreate the Redis job using the same ID.
+                            recoveryJobIdForPrepare = storedJobId;
                             shouldStartNewBackup = true;
                         } else {
                             console.error('Neizdevās pārbaudīt backup job:', recoveryError);
@@ -767,7 +804,11 @@ function BackupPage() {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         credentials: 'same-origin',
-                        body: JSON.stringify({ repositoryId: Number(repositoryId), walletAddress: currentAddress })
+                        body: JSON.stringify({
+                            repositoryId: Number(repositoryId),
+                            walletAddress: currentAddress,
+                            ...(recoveryJobIdForPrepare ? { recoveryJobId: recoveryJobIdForPrepare } : {})
+                        })
                     });
 
                     if (!response.ok) {
@@ -1173,7 +1214,7 @@ function BackupPage() {
                 await apiJsonWithRetry('/api/save-zip-tx', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ jobId, zipTxId, iv, merkleRoot, cryptoVersion: 1 })
+                    body: JSON.stringify({ jobId, zipTxId, iv, merkleRoot, cryptoVersion: 1, zipKeyVerifier })
                 });
             } else if (!zipTxId) {
                 await apiJson('/api/start-zip-upload', {
@@ -1296,7 +1337,8 @@ function BackupPage() {
                         zipTxId,
                         iv: iv ? Array.from(iv) : null,
                         merkleRoot: merkleRoot || null,
-                        cryptoVersion: 1
+                        cryptoVersion: 1,
+                        zipKeyVerifier
                     })
                 });
             }

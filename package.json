@@ -7,9 +7,10 @@
     "build": "vite build",
     "preview": "vite preview",
     "start": "node server.js",
-    "test": "node --test tests/backup.test.js tests/integration.test.js tests/platform.test.js",
+    "test": "node --test tests/backup.test.js tests/integration.test.js tests/platform.test.js tests/blockchain_recovery_test.js",
     "test:backup": "node --test tests/backup.test.js tests/integration.test.js",
-    "test:platform": "node --test tests/platform.test.js"
+    "test:platform": "node --test tests/platform.test.js",
+    "test:blockchain": "node --test tests/blockchain_recovery_test.js"
   },
   "dependencies": {
     "@ardrive/turbo-sdk": "1.42.0",

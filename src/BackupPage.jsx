@@ -12,7 +12,8 @@ const NFT_ABI = [
     "function getManifestURI(uint256 tokenId) external view returns (string)",
     "function getLastMerkleRoot(uint256 tokenId) external view returns (bytes32)",
     "function getNonce(uint256 tokenId) external view returns (uint256)",
-    "function addBackup(uint256 tokenId, bytes32 manifestHash, bytes32 merkleRoot, string calldata manifestURI, uint256 deadline, bytes calldata signature) external"
+    "function addBackup(uint256 tokenId, bytes32 manifestHash, bytes32 merkleRoot, string calldata manifestURI, uint256 deadline, bytes calldata signature) external",
+    "event BackupAdded(uint256 indexed tokenId, uint256 indexed backupNumber, bytes32 indexed merkleRoot, bytes32 manifestHash, string manifestURI, uint256 nonce)"
 ];
 
 function Icon({ name }) {
@@ -576,6 +577,11 @@ function BackupPage() {
                                         return;
                                     }
                                     setRecoveryRequired(true);
+                                    setRecoveredJobData({
+                                        ...jobStatus,
+                                        jobId: jobStatus.jobId,
+                                        backupTxHash: jobStatus.backupTxHash
+                                    });
                                     setStatus(t('recovery-required'));
                                     setError(getSafeErrorMessage(recoveryError, t));
                                     return;
@@ -584,15 +590,14 @@ function BackupPage() {
 
                             if (
                                 jobStatus.status === 'blockchain-finalizing' &&
-                                !jobStatus.backupTxHash &&
-                                storedBackupTx
+                                !jobStatus.backupTxHash
                             ) {
                                 setRecoveryRequired(true);
                                 setStatus(t('recovery-required'));
                                 setRecoveredJobData({
                                     ...jobStatus,
                                     jobId: jobStatus.jobId,
-                                    backupTxHash: storedBackupTx
+                                    backupTxHash: storedBackupTx || null
                                 });
                                 setFileInfo({ count: 0, sizeText: '', loading: false });
                                 return;
@@ -995,19 +1000,37 @@ function BackupPage() {
         readRecoveryJournal, updateRecoveryJournal, clearRecoveryJournal
     ]);
 
-    const startFreshBackup = useCallback(() => {
+    const startFreshBackup = useCallback(async () => {
+        const recoveryJournal = readRecoveryJournal();
+        const oldJobId = recoveredJobData?.jobId ||
+            localStorage.getItem(`permrepo-job-${repoStorageKey}`) ||
+            recoveryJournal?.jobId || preparedJobId;
+
+        setIsWorking(true);
+        setError('');
         try {
+            if (oldJobId && !recoveredJobData?.serverJobMissing) {
+                await apiJson('/api/abandon-backup', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ jobId: oldJobId })
+                });
+            }
+
             localStorage.removeItem(`permrepo-job-${repoStorageKey}`);
             localStorage.removeItem(`permrepo-backup-tx-${repoStorageKey}`);
-        } catch {}
-        clearRecoveryJournal();
-        uploadedZipRef.current = { txId: null, iv: null, merkleRoot: null };
-        uploadedManifestRef.current = { txId: null, manifest: null };
-        deletionMarkerRef.current = { marker: null, hash: null };
-        setRecoveredJobData(null);
-        setRecoveryRequired(false);
-        window.location.reload();
-    }, [repoStorageKey, clearRecoveryJournal]);
+            clearRecoveryJournal();
+            uploadedZipRef.current = { txId: null, iv: null, merkleRoot: null };
+            uploadedManifestRef.current = { txId: null, manifest: null };
+            deletionMarkerRef.current = { marker: null, hash: null };
+            setRecoveredJobData(null);
+            setRecoveryRequired(false);
+            window.location.reload();
+        } catch (error) {
+            setError(getSafeErrorMessage(error, t));
+            setIsWorking(false);
+        }
+    }, [apiJson, repoStorageKey, clearRecoveryJournal, readRecoveryJournal, recoveredJobData, preparedJobId, t]);
 
     const continueBackup = useCallback(async () => {
         if (recoveredJobData?.freshStartRequired) {
@@ -1784,17 +1807,87 @@ function BackupPage() {
     ]);
 
     const recoverBackup = useCallback(async () => {
-        const txHash = recoveredJobData?.backupTxHash ||
+        let txHash = recoveredJobData?.backupTxHash ||
             localStorage.getItem(`permrepo-backup-tx-${repoStorageKey}`);
-
-        if (!txHash) {
-            setError(t('no-backup-tx'));
-            return;
-        }
 
         try {
             setIsWorking(true);
             setError('');
+
+            // BC-08: the wallet may have broadcast addBackup but the browser
+            // closed before its returned hash reached localStorage/Redis.
+            // Search the recent chain history for the exact BackupAdded event.
+            if (!txHash && recoveredJobData?.status === 'blockchain-finalizing') {
+                if (!window.ethereum || !config?.nftAddress) {
+                    throw new Error(t('recovery-chain-search-unavailable'));
+                }
+                const provider = new ethers.BrowserProvider(window.ethereum);
+                const network = await provider.getNetwork();
+                if (Number(network.chainId) !== Number(config.chainId)) {
+                    throw new Error(t('network-changed'));
+                }
+                const latestBlock = await provider.getBlockNumber();
+                const earliestBlock = Math.max(0, latestBlock - 350000);
+                const eventInterface = new ethers.Interface([
+                    'event BackupAdded(uint256 indexed tokenId,uint256 indexed backupNumber,bytes32 indexed merkleRoot,bytes32 manifestHash,string manifestURI,uint256 nonce)'
+                ]);
+                const topics = eventInterface.encodeFilterTopics('BackupAdded', [
+                    BigInt(recoveredJobData.tokenId),
+                    BigInt(recoveredJobData.backupNumber),
+                    recoveredJobData.merkleRoot
+                ]);
+                const chunkSize = 5000;
+                for (let toBlock = latestBlock; toBlock >= earliestBlock && !txHash; toBlock -= chunkSize) {
+                    const fromBlock = Math.max(earliestBlock, toBlock - chunkSize + 1);
+                    const logs = await provider.getLogs({
+                        address: config.nftAddress,
+                        topics,
+                        fromBlock,
+                        toBlock
+                    });
+                    for (const log of logs) {
+                        try {
+                            const parsed = eventInterface.parseLog(log);
+                            if (
+                                parsed.args.manifestHash.toLowerCase() === recoveredJobData.manifestHash?.toLowerCase() &&
+                                parsed.args.merkleRoot.toLowerCase() === recoveredJobData.merkleRoot?.toLowerCase() &&
+                                parsed.args.manifestURI === recoveredJobData.manifestURI
+                            ) {
+                                txHash = log.transactionHash;
+                                break;
+                            }
+                        } catch {}
+                    }
+                }
+
+                if (txHash) {
+                    localStorage.setItem(`permrepo-backup-tx-${repoStorageKey}`, txHash);
+                    await apiJson('/api/save-backup-tx', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ jobId: recoveredJobData.jobId || preparedJobId, txHash })
+                    });
+                } else {
+                    // No matching mined event was found. Server independently
+                    // checks on-chain count/manifest before reopening the same
+                    // finalization so it can be signed and submitted again.
+                    await apiJson('/api/reopen-blockchain-finalize', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ jobId: recoveredJobData.jobId || preparedJobId })
+                    });
+                    setRecoveredJobData(prev => ({ ...prev, status: 'manifest-uploaded', backupTxHash: null }));
+                    setRecoveryRequired(false);
+                    setStatus(t('recovery-resubmit-ready'));
+                    setLastStatusData({ type: 'warning', key: 'recovery-resubmit-ready' });
+                    setIsWorking(false);
+                    return;
+                }
+            }
+
+            if (!txHash) {
+                throw new Error(t('no-backup-tx'));
+            }
 
             await apiJson('/api/complete-backup', {
                 method: 'POST',
@@ -1839,7 +1932,7 @@ function BackupPage() {
             setError(getSafeErrorMessage(e, t));
             setIsWorking(false);
         }
-    }, [recoveredJobData, preparedJobId, apiJson, t, repoName, nftInfo, lastManifestTxId, clearRecoveryJournal, repoStorageKey]);
+    }, [recoveredJobData, preparedJobId, apiJson, t, config, repoName, nftInfo, lastManifestTxId, clearRecoveryJournal, repoStorageKey]);
 
     if (!config) {
         return (
@@ -1938,32 +2031,17 @@ function BackupPage() {
                 </>
             )}
             
-            {recoveredJobData?.freshStartRequired ? (
+            {!backupCompleted && !recoveredJobData?.freshStartRequired && (recoveryRequired && !recoveredJobData?.serverJobMissing && (recoveredJobData?.backupTxHash || localStorage.getItem(`permrepo-backup-tx-${repoStorageKey}`)) ? (
                 <button
-                    onClick={startFreshBackup}
-                    disabled={isWorking}
-                    className="sign-button"
-                    style={{ marginTop: '20px' }}
-                >
-                    {t('start-new-backup')}
-                </button>
-            ) : recoveryRequired && !recoveredJobData?.serverJobMissing && (recoveredJobData?.backupTxHash || localStorage.getItem(`permrepo-backup-tx-${repoStorageKey}`)) ? (
-                <button 
                     onClick={recoverBackup}
                     disabled={isWorking}
                     className="sign-button"
                     style={{ marginTop: '20px', background: 'linear-gradient(135deg, #f0ad4e 0%, #d98b3a 100%)' }}
                 >
-                    {isWorking ? (
-                        <div style={{ textAlign: 'center' }}>
-                            <div className="spinner"></div>
-                        </div>
-                    ) : (
-                        t('recover-backup')
-                    )}
+                    {isWorking ? <div className="spinner"></div> : t('recover-backup')}
                 </button>
-            ) : !backupCompleted ? (
-                <button 
+            ) : (
+                <button
                     onClick={continueBackup}
                     disabled={
                         isWorking ||
@@ -1974,16 +2052,12 @@ function BackupPage() {
                     className="sign-button"
                     style={{ marginTop: '20px' }}
                 >
-                    {isWorking ? (
-                        <div style={{ textAlign: 'center' }}>
-                            <div className="spinner"></div>
-                        </div>
-                    ) : (
-                        t('continue-backup')
-                    )}
+                    {isWorking ? <div className="spinner"></div> : t('continue-backup')}
                 </button>
-            ) : (
-                <button 
+            ))}
+
+            {backupCompleted && (
+                <button
                     onClick={() => navigate('/')}
                     className="sign-button"
                     style={{ marginTop: '20px' }}
@@ -1991,7 +2065,18 @@ function BackupPage() {
                     {t('back-home')}
                 </button>
             )}
-            
+
+            {/* This action is intentionally always visible, including when an
+                unfinished backup can also be resumed. */}
+            <button
+                onClick={startFreshBackup}
+                disabled={isWorking}
+                className="sign-button"
+                style={{ marginTop: '12px', background: 'linear-gradient(135deg, #555 0%, #333 100%)' }}
+            >
+                {t('start-new-backup')}
+            </button>
+
             {status && (
                 <div className="status-card" style={{ display: 'block' }}>
                     <div style={{ whiteSpace: 'pre-wrap' }}>

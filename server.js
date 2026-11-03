@@ -2292,12 +2292,17 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
                     return res.status(403).json({ success: false, error: 'Atkopšanas job neatbilst šim repozitorijam vai makam.' });
                 }
 
-                // ✅ Tikai nepabeikti job ir jāatjauno. Completed un failed job
-                // nozīmē, ka iepriekšējais backups ir pabeigts vai neizdevies,
-                // un lietotājam ir jāļauj sākt jaunu backupu ar jaunu ID.
-                const isUnfinished = !['completed', 'failed'].includes(existingRecoveryJob.status);
+                // ✅ Tikai job ar augšupielādētu ZIP/manifestu/transakciju ir
+                // jāatjauno. 'prepared' bez ZIP, 'completed' un 'failed' nozīmē,
+                // ka iepriekšējais backups nav aktīvi jāatjauno — lietotājam
+                // jāļauj sākt jaunu backupu.
+                const hasUploadedArtifact = Boolean(
+                    existingRecoveryJob.zipTxId ||
+                    existingRecoveryJob.manifestTxId ||
+                    existingRecoveryJob.backupTxHash
+                );
 
-                if (isUnfinished) {
+                if (hasUploadedArtifact) {
                     return res.status(409).json({
                         success: false,
                         error: 'Atkopšanas job jau eksistē Redis. Atjauno to pēc esošā job ID.',
@@ -2305,7 +2310,7 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
                     });
                 }
 
-                console.log(`ℹ️ Atkopšanas job ${requestedRecoveryJobId} ir ${existingRecoveryJob.status} — ļaujam sākt jaunu backupu.`);
+                console.log(`ℹ️ Atkopšanas job ${requestedRecoveryJobId} (${existingRecoveryJob.status}) bez augšupielādēta ZIP — ļaujam sākt jaunu backupu.`);
             }
         }
         const now = Date.now();

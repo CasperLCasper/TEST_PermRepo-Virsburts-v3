@@ -1,3 +1,4 @@
+
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -10,7 +11,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = file => fs.readFileSync(path.join(root, file), 'utf8');
 const exists = file => fs.existsSync(path.join(root, file));
 
-// ✅ Restore platforma atrodas atsevišķi (Arweave permanent web).
+// Restore platforma atrodas atsevišķi (Arweave permanent web).
 // Ja tās faili ir iekļauti repozitorijā, tos pārbaudām; ja nav — izlaižam.
 const RESTORE_TRANSLATIONS_PATH = 'restore/translations.js';
 const RESTORE_JS_PATH = 'restore.js';
@@ -29,7 +30,10 @@ function loadRestoreTranslations() {
       if (source[i] === '{') depth++;
       else if (source[i] === '}') {
         depth--;
-        if (depth === 0) { end = i; break; }
+        if (depth === 0) {
+          end = i;
+          break;
+        }
       }
     }
     if (end < 0) return null;
@@ -113,7 +117,9 @@ test('P05 — svarīgākie servera API ceļi paliek definēti', () => {
     "app.post('/api/save-manifest-tx'",
     "app.post('/api/complete-backup'",
     "app.get('/api/"
-  ]) assert.ok(source.includes(route), `Trūkst vai mainīts API ceļš: ${route}`);
+  ]) {
+    assert.ok(source.includes(route), `Trūkst vai mainīts API ceļš: ${route}`);
+  }
 });
 
 test('P06 — NFT līgums saglabā migrāciju, ne-tirgojamu NFT aizsardzību un backup metadatu lasītājus', () => {
@@ -149,7 +155,10 @@ test('P09 — frontend un servera avotos nav ieslēgts acīmredzams eval/Functio
 
 test('P10 — accounting-redis saglabā atļautās backup state pārejas un aizliedz pabeigta job pārejas', () => {
   const source = read('accounting-redis.js');
-  const block = source.slice(source.indexOf('const VALID_TRANSITIONS = {'), source.indexOf('};', source.indexOf('const VALID_TRANSITIONS = {')) + 2);
+  const transitionsStart = source.indexOf('const VALID_TRANSITIONS = {');
+  const transitionsEnd = source.indexOf('};', transitionsStart);
+  const block = source.slice(transitionsStart, transitionsEnd + 2);
+
   assert.ok(block.includes("'prepared': ['zip-uploading', 'failed']"));
   assert.ok(block.includes("'zip-uploading': ['zip-uploaded', 'failed']"));
   assert.ok(block.includes("'zip-uploaded': ['manifest-uploading', 'failed']"));
@@ -169,10 +178,17 @@ test('P11 — Vite konfigurācija un HTML sākumpunkts ir klātesoši', () => {
 
 test('P12 — iepriekšējā manifesta atbilde tiek ierobežota pirms JSON parsēšanas', () => {
   const source = read('server.js');
-  assert.match(source, /async function readJsonResponseWithLimit\(response, maxBytes\)/);
-  assert.match(source, /totalBytes \+= value\.byteLength/);
-  assert.match(source, /totalBytes > maxBytes/);
-  assert.match(source, /readJsonResponseWithLimit\(response, MAX_MANIFEST_BYTES\)/);
+
+  assert.match(
+    source,
+    /async function readResponseBytesWithLimit\s*\(\s*response\s*,\s*maxBytes/
+  );
+  assert.match(source, /totalBytes\s*\+=\s*value\.byteLength/);
+  assert.match(source, /totalBytes\s*>\s*maxBytes/);
+  assert.match(
+    source,
+    /readResponseBytesWithLimit\s*\(\s*response\s*,\s*MAX_MANIFEST_BYTES/
+  );
   assert.doesNotMatch(source, /const manifest = await response\.json\(\)/);
 });
 
@@ -180,47 +196,57 @@ test('P13 — limita funkcija noraida pārāk lielu manifesta atbildi pirms pars
   const source = read('server.js');
   const start = source.indexOf("async function readResponseBytesWithLimit(response, maxBytes, label = 'Manifests') {");
   const end = source.indexOf('\nasync function readJsonResponseWithLimit', start);
+
   assert.ok(start >= 0 && end > start, 'Nav atrasta manifesta izmēra limita funkcija.');
+
   const readLimited = new Function('Buffer', `return (${source.slice(start, end)});`)(Buffer);
+
   await assert.rejects(
     readLimited(new Response('x'.repeat(100)), 20, 'Iepriekšējais manifests'),
     /pārsniedz maksimālo izmēru/
   );
-  assert.equal((await readLimited(new Response('{"ok":true}'), 20)).toString('utf8'), '{"ok":true}');
+
+  assert.equal(
+    (await readLimited(new Response('{"ok":true}'), 20)).toString('utf8'),
+    '{"ok":true}'
+  );
 });
 
-test('P14 — ANS-104 verifikatora palīgfunkcija nav obligāta manifesta ielādes plūsmai', () => {
+test('P14 — ANS-104 verifikators ir definēts un pārbauda Data Item autentiskumu', () => {
   const source = read('server.js');
-  assert.match(source, /import \{ DataItem \} from '@dha-team\/arbundles';/);
+
+  assert.match(
+    source,
+    /import\s*\{\s*DataItem\s*\}\s*from\s*['"]@dha-team\/arbundles['"]/,
+    'Nav importēts ANS-104 DataItem verifikators.'
+  );
+
   const start = source.indexOf('async function verifyArweaveDataItem(');
   const end = source.indexOf('\nasync function loadPreviousManifest', start);
+
   assert.ok(start >= 0 && end > start, 'Nav atrasta ANS-104 autentiskuma pārbaude.');
+
   const verifier = source.slice(start, end);
-  assert.match(verifier, /x-ar-io-root-transaction-id/);
-  assert.match(verifier, /x-ar-io-root-item-offset/);
-  assert.match(verifier, /x-ar-io-root-item-size/);
-  assert.match(verifier, /Range:/);
+
+  assert.match(verifier, /DataItem\.verify\(rawItem\)/);
   assert.match(verifier, /await item\.isValid\(\)/);
   assert.match(verifier, /item\.id !== manifestId/);
   assert.match(verifier, /item\.rawData\)\.equals\(manifestBytes\)/);
-  const loaderStart = source.indexOf('async function loadPreviousManifest(');
-  const loaderEnd = source.indexOf('\nconst NFT_ABI', loaderStart);
-  const loader = source.slice(loaderStart, loaderEnd);
-  assert.doesNotMatch(loader, /verifyArweaveDataItem\(/);
 });
 
 test('P15 — izolētais ANS-104 palīgs atbalsta AR.IO offsets endpoint', () => {
   const source = read('server.js');
   const start = source.indexOf('async function verifyArweaveDataItem(');
   const end = source.indexOf('\nasync function loadPreviousManifest', start);
+
   assert.ok(start >= 0 && end > start, 'Nav atrasta ANS-104 autentiskuma pārbaude.');
+
   const verifier = source.slice(start, end);
+
   assert.match(verifier, /\/ar-io\/offsets\//);
   assert.match(verifier, /offsets\?\.rootTxId/);
   assert.match(verifier, /offsets\?\.rootOffset/);
   assert.match(verifier, /offsets\?\.size/);
-  // ✅ Atjaunināts: serveris lieto redirect: 'follow', kas ir pieņemami, jo
-  //    ANS-104 verifikācija notiek pēc satura, nevis pēc URL
   assert.match(verifier, /redirect: 'follow'/);
   assert.match(verifier, /DataItem\.verify\(rawItem\)/);
   assert.match(verifier, /await item\.isValid\(\)/);
@@ -232,8 +258,11 @@ test('P16 — izolētais ANS-104 palīgs atbalsta HEAD /raw rezerves ceļu', () 
   const source = read('server.js');
   const start = source.indexOf('async function verifyArweaveDataItem(');
   const end = source.indexOf('\nasync function loadPreviousManifest', start);
+
   assert.ok(start >= 0 && end > start, 'Nav atrasta ANS-104 autentiskuma pārbaude.');
+
   const verifier = source.slice(start, end);
+
   assert.match(verifier, /method: 'HEAD'/);
   assert.match(verifier, /\/raw\/\$\{encodeURIComponent\(manifestId\)\}/);
   assert.match(verifier, /x-ar-io-root-data-item-offset/);
@@ -246,8 +275,11 @@ test('P17 — izolētais ANS-104 palīgs atpazīst Data-Item pozīcijas galvenes
   const source = read('server.js');
   const start = source.indexOf('async function verifyArweaveDataItem(');
   const end = source.indexOf('\nasync function loadPreviousManifest', start);
+
   assert.ok(start >= 0 && end > start, 'Nav atrasta ANS-104 autentiskuma pārbaude.');
+
   const verifier = source.slice(start, end);
+
   assert.match(verifier, /x-ar-io-data-item-offset/);
   assert.match(verifier, /x-ar-io-data-item-size/);
   assert.match(verifier, /X-AR-IO-Root-Transaction-Id/);
@@ -257,27 +289,63 @@ test('P17 — izolētais ANS-104 palīgs atpazīst Data-Item pozīcijas galvenes
   assert.match(verifier, /item\.rawData\)\.equals\(manifestBytes\)/);
 });
 
-test('P18 — iepriekšējais manifests tiek ielādēts caur konfigurēto vārteju un pilnībā validēts', () => {
+test('P18 — iepriekšējais manifests tiek ielādēts caur konfigurēto vārteju un verificēts pirms JSON parsēšanas un validācijas', () => {
   const source = read('server.js');
-  const start = source.indexOf('async function loadPreviousManifest(');
-  const end = source.indexOf('\nconst NFT_ABI', start);
-  assert.ok(start >= 0 && end > start, 'Nav atrasta iepriekšējā manifesta ielādes funkcija.');
-  const loader = source.slice(start, end);
-  assert.match(loader, /getValidatedManifestUrl\(prevManifestId\)/);
-  assert.match(loader, /readJsonResponseWithLimit\(response, MAX_MANIFEST_BYTES\)/);
-  assert.match(loader, /validateManifest\(manifest\)/);
-  assert.match(loader, /backup ir apturēts/);
-  assert.doesNotMatch(loader, /verifyArweaveDataItem\(/);
-  assert.doesNotMatch(loader, /offsets|method: 'HEAD'/);
+
+  const verifierStart = source.indexOf('async function verifyArweaveDataItem(');
+  const loaderStart = source.indexOf('async function loadPreviousManifest(');
+  const loaderEnd = source.indexOf('\nconst NFT_ABI', loaderStart);
+
+  assert.ok(verifierStart >= 0, 'Nav atrasta verifyArweaveDataItem funkcija.');
+  assert.ok(loaderStart >= 0 && loaderEnd > loaderStart, 'Nav atrasta loadPreviousManifest funkcija.');
+
+  const loader = source.slice(loaderStart, loaderEnd);
+
+  assert.match(
+    loader,
+    /getValidatedManifestUrl\s*\(\s*prevManifestId\s*\)/,
+    'Manifesta URL netiek iegūts caur getValidatedManifestUrl().'
+  );
+
+  assert.match(
+    loader,
+    /readResponseBytesWithLimit\s*\(\s*response\s*,\s*MAX_MANIFEST_BYTES\s*,/,
+    'Manifesta atbilde netiek nolasīta ar MAX_MANIFEST_BYTES limitu.'
+  );
+
+  assert.match(
+    loader,
+    /await verifyArweaveDataItem\s*\(\s*response\s*,\s*manifestBytes\s*,\s*prevManifestId\s*,\s*fetch\s*,\s*AR_IO_GATEWAY\s*\)/,
+    'Manifesta ielādes plūsma neizsauc ANS-104 verifikāciju ar nepieciešamajiem argumentiem.'
+  );
+
+  assert.match(loader, /JSON\.parse\s*\(/, 'Pēc verifikācijas netiek parsēts manifesta JSON.');
+  assert.match(loader, /validateManifest\s*\(\s*manifest\s*\)/, 'Manifests netiek validēts.');
+  assert.match(loader, /backup ir apturēts/, 'Nav atrasts backup apturēšanas kļūdas paziņojums.');
+
+  const verificationPosition = loader.indexOf('await verifyArweaveDataItem(');
+  const parsingPosition = loader.indexOf('JSON.parse');
+  const validationPosition = loader.indexOf('validateManifest(manifest)');
+
+  assert.ok(
+    verificationPosition >= 0 &&
+    parsingPosition > verificationPosition &&
+    validationPosition > parsingPosition,
+    'Nepareiza secība: vispirms jāverificē ANS-104, tad jāparsē JSON un jāvalidē manifests.'
+  );
 });
 
-// ✅ S01: Lock zaudēšanas testi platformas līmenī
+
+// S01: Lock zaudēšanas testi platformas līmenī
 
 test('P19 — withJobLock atceļ darbu, kad lock tiek zaudēts (S01)', () => {
   const source = read('server.js');
   const start = source.indexOf('async function withJobLock(jobId, fn) {');
+
   assert.ok(start >= 0, 'Nav atrasta withJobLock funkcija.');
+
   const lockFn = source.slice(start, start + 3000);
+
   assert.match(lockFn, /lockLostController\.abort/);
   assert.match(lockFn, /lockSignal:\s*lockLostController\.signal/);
   assert.match(lockFn, /lockToken:\s*token/);
@@ -285,53 +353,67 @@ test('P19 — withJobLock atceļ darbu, kad lock tiek zaudēts (S01)', () => {
 
 test('P20 — throwIfLockLost ir definēta un izmanto signal.aborted (S01)', () => {
   const source = read('server.js');
+
   assert.match(source, /function throwIfLockLost\(signal\)\s*\{/);
+
   const start = source.indexOf('function throwIfLockLost(signal)');
   const end = source.indexOf('}', source.indexOf('throw', start));
   const fn = source.slice(start, end);
+
   assert.match(fn, /signal\?\.aborted/);
   assert.match(fn, /throw/);
 });
 
-// ✅ B03: deletedFiles testi platformas līmenī
+
+// B03: deletedFiles testi platformas līmenī
 
 test('P21 — BackupPage sūta deletedFiles manifestā (B03)', () => {
   const page = read('src/BackupPage.jsx');
-  assert.match(page, /deletedFiles:\s*deletedFiles/,
-    'Manifestā netiek iekļauts deletedFiles.');
-  assert.match(page, /const deletedFiles = Object\.keys\(previousPaths\)\.filter/,
-    'Nav deletedFiles aprēķina.');
-  assert.match(page, /setDeletedFilesForUpload\(deletedFiles\)/,
-    'deletedFiles netiek saglabāts state.');
+
+  assert.match(page, /deletedFiles:\s*deletedFiles/, 'Manifestā netiek iekļauts deletedFiles.');
+  assert.match(page, /const deletedFiles = Object\.keys\(previousPaths\)\.filter/, 'Nav deletedFiles aprēķina.');
+  assert.match(page, /setDeletedFilesForUpload\(deletedFiles\)/, 'deletedFiles netiek saglabāts state.');
 });
 
 test('P22 — restore.js atbalsta deletedFiles (B03)', { skip: !hasRestoreFiles }, () => {
   const source = read(RESTORE_JS_PATH);
-  assert.match(source, /manifest\.deletedFiles/,
-    'restore.js nelasa manifest.deletedFiles.');
+
+  assert.match(source, /manifest\.deletedFiles/, 'restore.js nelasa manifest.deletedFiles.');
   assert.match(source, /deletedCount/, 'restore.js neuzrāda deletedCount.');
-  assert.match(source, /for \(const filePath of manifest\.deletedFiles\)/,
-    'Nav deletedFiles validācijas cikla.');
+  assert.match(source, /for \(const filePath of manifest\.deletedFiles\)/, 'Nav deletedFiles validācijas cikla.');
 });
 
-// ✅ R01: archive.contains un merkleRoot testi platformas līmenī
+
+// R01: archive.contains un merkleRoot testi platformas līmenī
 
 test('P23 — BackupPage veido archive.contains un merkleRoot (R01)', () => {
   const page = read('src/BackupPage.jsx');
-  assert.match(page, /const archiveContains = changedFiles\.map/,
-    'Nav archive.contains veidošanas.');
+
+  assert.match(page, /const archiveContains = changedFiles\.map/, 'Nav archive.contains veidošanas.');
   assert.match(page, /contains:\s*archiveContains/, 'archive.contains netiek iekļauts manifestā.');
   assert.match(page, /merkleRoot:\s*merkleRoot/, 'merkleRoot netiek iekļauts manifestā.');
 });
 
 test('P24 — restore.js prasa archive.contains un merkleRoot (R01)', { skip: !hasRestoreFiles }, () => {
   const source = read(RESTORE_JS_PATH);
-  assert.match(source, /if \(!Array\.isArray\(manifest\.archive\.contains\) \|\| manifest\.archive\.contains\.length === 0\)/,
-    'restore.js neprasa archive.contains.');
-  assert.match(source, /typeof manifest\.merkleRoot !== 'string' \|\| !\/\^0x\[0-9a-fA-F\]\{64\}\$\/\.test\(manifest\.merkleRoot\)/,
-    'restore.js neprasa merkleRoot.');
-  assert.match(source, /calculatedRoot\.toLowerCase\(\) !== manifest\.merkleRoot\.toLowerCase\(\)/,
-    'restore.js nepārbauda merkleRoot atbilstību archive.contains.');
+
+  assert.match(
+    source,
+    /if \(!Array\.isArray\(manifest\.archive\.contains\) \|\| manifest\.archive\.contains\.length === 0\)/,
+    'restore.js neprasa archive.contains.'
+  );
+
+  assert.match(
+    source,
+    /typeof manifest\.merkleRoot !== 'string' \|\| !\/\^0x\[0-9a-fA-F\]\{64\}\$\/\.test\(manifest\.merkleRoot\)/,
+    'restore.js neprasa merkleRoot.'
+  );
+
+  assert.match(
+    source,
+    /calculatedRoot\.toLowerCase\(\) !== manifest\.merkleRoot\.toLowerCase\(\)/,
+    'restore.js nepārbauda merkleRoot atbilstību archive.contains.'
+  );
 });
 
 
@@ -359,9 +441,9 @@ test('P26 — ZIP atslēgas verifikators tiek saglabāts Redis job un atgriezts 
   assert.match(client, /cryptoVersion: 1, zipKeyVerifier/);
 });
 
-
 test('P27 — galvenā lapa atrod nepabeigtu backup Redis arī bez localStorage jobId', () => {
   const app = read('src/App.jsx');
+
   assert.match(app, /\/api\/recover-job\?repositoryId=/, 'Galvenā lapa neveic Redis job meklēšanu.');
   assert.match(app, /walletAddress=\$\{encodeURIComponent\(userAddress\)\}/, 'Redis meklēšanai netiek izmantots pieslēgtais maks.');
   assert.match(app, /localStorage\.setItem\(`permrepo-job-\$\{repoKey\}`, storedJobId\)/, 'Atrastais Redis jobId netiek saglabāts kā lokāls rezerves kontrolpunkts.');

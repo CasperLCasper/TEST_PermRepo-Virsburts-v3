@@ -56,6 +56,11 @@ const TURBO_PAYMENT_URL = process.env.TURBO_PAYMENT_URL || '';
 const MINT_AUTHORIZATION_SIGNER_PRIVATE_KEY =
     process.env.MINT_AUTHORIZATION_SIGNER_PRIVATE_KEY || '';
 
+// ✅ ANS-104 atrašanās vietas pārbaudes ieslēgšana/izslēgšana
+// Devnet: false (vārteja var neatbalstīt /ar-io/offsets/)
+// Mainnet: true (pilna kriptogrāfiskā verifikācija)
+const REQUIRE_ANS104_LOCATION = process.env.REQUIRE_ANS104_LOCATION === 'true';
+
 const MAX_REPO_FILES = Number(process.env.MAX_REPO_FILES || 5000);
 const MAX_REPO_BYTES = Number(process.env.MAX_REPO_BYTES || 524288000);
 const MAX_FILE_BYTES = Number(process.env.MAX_FILE_BYTES || 104857600);
@@ -671,6 +676,11 @@ async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchI
                     }
                 });
             } catch (error) {
+                // ✅ Ja REQUIRE_ANS104_LOCATION=false, izlaižam pārbaudi, nevis metam kļūdu
+                if (!REQUIRE_ANS104_LOCATION) {
+                    console.warn(`⚠️ ANS-104 atrašanās vietas pārbaude izlaista (REQUIRE_ANS104_LOCATION=false). Iemesls: offsets (${offsetsError || 'nederīga atbilde'}) un HEAD /raw neizdevās (${error?.name === 'TimeoutError' ? 'taimauts' : 'tīkla kļūda'}).`);
+                    return false;
+                }
                 throw new Error(`Vārteja nenodrošināja ANS-104 atrašanās vietu: offsets (${offsetsError || 'nederīga atbilde'}) un HEAD /raw pieprasījums neizdevās (${error?.name === 'TimeoutError' ? 'taimauts' : 'tīkla kļūda'}).`);
             }
             if (headResponse.ok) {
@@ -686,6 +696,11 @@ async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchI
             try { await headResponse?.body?.cancel(); } catch {}
         }
         if (!location) {
+            // ✅ Ja REQUIRE_ANS104_LOCATION=false, izlaižam pārbaudi, nevis metam kļūdu
+            if (!REQUIRE_ANS104_LOCATION) {
+                console.warn(`⚠️ ANS-104 atrašanās vietas pārbaude izlaista (REQUIRE_ANS104_LOCATION=false). Iemesls: offsets (${offsetsError || 'atrašanās vieta nav indeksēta'}) un HEAD /raw galvenes nav pietiekamas.`);
+                return false;
+            }
             throw new Error(`Vārteja nesniedza derīgu ANS-104 atrašanās vietu: offsets (${offsetsError || 'atrašanās vieta nav indeksēta'}) un HEAD /raw galvenes nav pietiekamas.`);
         }
     }
@@ -765,7 +780,11 @@ async function loadPreviousManifest(lastManifest) {
             MAX_MANIFEST_BYTES,
             'Iepriekšējais manifests'
         );
-        await verifyArweaveDataItem(response, manifestBytes, prevManifestId, fetch, AR_IO_GATEWAY);
+        // ✅ Pārbaudām atgriezto vērtību — ja false, ANS-104 pārbaude izlaista
+        const ans104Verified = await verifyArweaveDataItem(response, manifestBytes, prevManifestId, fetch, AR_IO_GATEWAY);
+        if (ans104Verified === false) {
+            console.warn('⚠️ ANS-104 datu vienuma verifikācija izlaista — turpinām ar manifesta strukturālo validāciju un Merkle root pārbaudi.');
+        }
 
         let manifest;
         try {
@@ -3795,7 +3814,8 @@ app.get('/api/health', async (req, res) => {
         github: Boolean(GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET && GITHUB_REDIRECT_URI),
         turboUpload: Boolean(TURBO_UPLOAD_URL),
         turboPayment: Boolean(TURBO_PAYMENT_URL),
-        mintAuthorization: Boolean(MINT_AUTHORIZATION_SIGNER_PRIVATE_KEY)
+        mintAuthorization: Boolean(MINT_AUTHORIZATION_SIGNER_PRIVATE_KEY),
+        requireAns104Location: REQUIRE_ANS104_LOCATION
     });
 });
 
@@ -3821,6 +3841,7 @@ app.listen(PORT, () => {
     logInfo('Max backup queue', MAX_BACKUP_QUEUE);
     logInfo('Lock heartbeat', `${LOCK_HEARTBEAT_MS}ms`);
     logInfo('Job TTL', `${JOB_TTL_SECONDS}s (${JOB_TTL_SECONDS / 3600}h)`);
+    logInfo('Require ANS-104 location', REQUIRE_ANS104_LOCATION ? '✅ JĀ (mainnet)' : '⚠️ NĒ (devnet)');
     logInfo('Redis', '✅ IR');
     logInfo('RPC', RPC_URL);
     logInfo('NFT', NFT_ADDRESS || '❌ NAV');

@@ -40,7 +40,7 @@ async function writeJobOwnerLookup(client, jobId, job, ttl) {
     const key = jobOwnerLookupKey(job);
     if (!key) return;
 
-    if (job.status === 'completed') {
+    if (job.status === 'completed' || job.status === 'abandoned') {
         const current = await client.get(key);
         if (String(current || '') === String(jobId)) await client.del(key);
         return;
@@ -50,6 +50,19 @@ async function writeJobOwnerLookup(client, jobId, job, ttl) {
         await client.set(key, jobId, { ex: ttl });
     } else {
         await client.set(key, jobId);
+    }
+}
+
+export async function clearJobOwnerLookup(job) {
+    const client = requireRedis();
+    const key = jobOwnerLookupKey(job);
+    if (!key) return false;
+    try {
+        await client.del(key);
+        return true;
+    } catch (error) {
+        console.error('Redis job owner lookup dzēšana neizdevās:', error);
+        throw new Error('Neizdevās atbrīvot iepriekšējā backup darba indeksu.');
     }
 }
 

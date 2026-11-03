@@ -2282,7 +2282,7 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
         if (requestedRecoveryJobId != null && !validateJobId(requestedRecoveryJobId)) {
             return res.status(400).json({ success: false, error: 'Nederīgs atkopšanas job ID.' });
         }
-        const jobId = requestedRecoveryJobId || crypto.randomUUID();
+        let jobId = requestedRecoveryJobId || crypto.randomUUID();
         if (requestedRecoveryJobId) {
             const existingRecoveryJob = await getJob(requestedRecoveryJobId);
             if (existingRecoveryJob) {
@@ -2295,7 +2295,7 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
                 // ✅ Tikai job ar augšupielādētu ZIP/manifestu/transakciju ir
                 // jāatjauno. 'prepared' bez ZIP, 'completed' un 'failed' nozīmē,
                 // ka iepriekšējais backups nav aktīvi jāatjauno — lietotājam
-                // jāļauj sākt jaunu backupu.
+                // jāļauj sākt jaunu backupu ar JAUNU jobId.
                 const hasUploadedArtifact = Boolean(
                     existingRecoveryJob.zipTxId ||
                     existingRecoveryJob.manifestTxId ||
@@ -2310,7 +2310,11 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
                     });
                 }
 
-                console.log(`ℹ️ Atkopšanas job ${requestedRecoveryJobId} (${existingRecoveryJob.status}) bez augšupielādēta ZIP — ļaujam sākt jaunu backupu.`);
+                // ✅ Vecais job ir 'prepared' bez augšupielādēta ZIP — tas ir
+                // "tukšs". Sākam jaunu backupu ar JAUNU jobId, lai izvairītos
+                // no 'Job ar šādu ID jau eksistē' kļūdas createJob().
+                jobId = crypto.randomUUID();
+                console.log(`ℹ️ Atkopšanas job ${requestedRecoveryJobId} (${existingRecoveryJob.status}) bez augšupielādēta ZIP — sākam jaunu backupu ar jaunu jobId ${jobId}.`);
             }
         }
         const now = Date.now();

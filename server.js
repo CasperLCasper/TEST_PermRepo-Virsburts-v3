@@ -22,6 +22,7 @@ import {
     createJob,
     getJob,
     findJobByOwner,
+    clearJobOwnerLookup,
     updateJob,
     resolveJobTtl,
     acquireJobLock,
@@ -38,6 +39,9 @@ app.set('trust proxy', 1);
 
 const PORT = Number(process.env.PORT || 3000);
 const ARWEAVE_GATEWAY = process.env.ARWEAVE_GATEWAY || '';
+// ANS-104 offsets are resolved through an AR.IO gateway even when manifest
+// content is served by the classic arweave.net gateway.
+const AR_IO_GATEWAY = process.env.AR_IO_GATEWAY || 'https://ar-io.dev';
 const CHAIN_ID = process.env.CHAIN_ID || '';
 const RPC_URL = process.env.RPC_URL || '';
 const NFT_ADDRESS = process.env.NFT_ADDRESS || '';
@@ -595,7 +599,7 @@ async function fetchWithRetry(url, options, attempts = 3, label = 'Pieprasījums
 
 async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchImpl = fetch, sourceGateway = ARWEAVE_GATEWAY) {
     const responseId = response.headers.get('x-ar-io-data-id');
-    if (responseId !== manifestId) {
+    if (responseId && responseId !== manifestId) {
         throw new Error('Vārtejas atdotā manifesta ID neatbilst pieprasītajam ID.');
     }
 
@@ -754,7 +758,21 @@ async function loadPreviousManifest(lastManifest) {
             throw new Error(`Iepriekšējā manifesta ielāde neizdevās (HTTP ${response.status}).`);
         }
 
-        const manifest = await readJsonResponseWithLimit(response, MAX_MANIFEST_BYTES);
+        // Read once, then authenticate the exact bytes against the signed
+        // ANS-104 DataItem before trusting any manifest field.
+        const manifestBytes = await readResponseBytesWithLimit(
+            response,
+            MAX_MANIFEST_BYTES,
+            'Iepriekšējais manifests'
+        );
+        await verifyArweaveDataItem(response, manifestBytes, prevManifestId, fetch, AR_IO_GATEWAY);
+
+        let manifest;
+        try {
+            manifest = JSON.parse(manifestBytes.toString('utf8'));
+        } catch {
+            throw new Error('Iepriekšējā manifesta saturs nav derīgs JSON.');
+        }
         if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
             throw new Error('Iepriekšējā manifesta saturs nav derīgs JSON objekts.');
         }
@@ -807,6 +825,7 @@ function getAllowedConnectOrigins() {
 
     for (const value of [
         ARWEAVE_GATEWAY,
+        AR_IO_GATEWAY,
         RPC_URL,
         TURBO_UPLOAD_URL,
         TURBO_PAYMENT_URL
@@ -3273,6 +3292,58 @@ app.post('/api/start-blockchain-finalize', backupLimiter, async (req, res) => {
     }
 });
 
+app.post('/api/reopen-blockchain-finalize', backupLimiter, async (req, res) => {
+    try {
+        assertSameOrigin(req);
+        if (!requireGithubSession(req, res)) return;
+        const { jobId } = req.body;
+        if (!validateJobId(jobId)) {
+            return res.status(400).json({ success: false, error: 'Nederīgs job ID.' });
+        }
+
+        return await withJobLock(jobId, async ({ lockSignal, lockToken }) => {
+            const job = await getJob(jobId);
+            const wallet = await verifyJobAuthorization(req, job);
+            await verifyJobNFTAuthorization({ ...job, walletAddress: wallet });
+            throwIfLockLost(lockSignal);
+
+            if (job.status !== 'blockchain-finalizing' || job.backupTxHash) {
+                throw new Error('Blockchain finalizāciju nevar droši atsākt no pašreizējā stāvokļa.');
+            }
+            if (!job.tokenId || !job.backupNumber || !job.manifestURI) {
+                throw new Error('Atkopšanai trūkst blockchain finalizācijas datu.');
+            }
+
+            const provider = getProvider();
+            const nft = new ethers.Contract(NFT_ADDRESS, NFT_ABI, provider);
+            const [onChainCount, onChainManifest] = await Promise.all([
+                nft.getBackupCount(BigInt(job.tokenId)),
+                nft.getManifestURI(BigInt(job.tokenId))
+            ]);
+            throwIfLockLost(lockSignal);
+
+            if (onChainCount >= BigInt(job.backupNumber) || onChainManifest === job.manifestURI) {
+                throw new Error('Backup transakcija, iespējams, jau ir iekļauta blockchain. Atkopšana jāturpina ar transakcijas pārbaudi; jaunu parakstu vēl nedrīkst sūtīt.');
+            }
+
+            await updateJob(jobId, {
+                status: 'manifest-uploaded',
+                backupTxHash: null,
+                backupTxSubmittedAt: null,
+                retryableBlockchainFailure: false,
+                error: null,
+                updatedAt: Date.now()
+            }, undefined, { lockToken });
+
+            return res.json({ success: true, status: 'manifest-uploaded', safeToResubmit: true });
+        });
+    } catch (error) {
+        const message = errorMessage(error);
+        const status = /nav atrasts|nav github|nepieder|nederīgs|nederīga state|slēdzene/i.test(message) ? 400 : 409;
+        return res.status(status).json({ success: false, error: message });
+    }
+});
+
 app.post('/api/save-backup-tx', backupLimiter, async (req, res) => {
     try {
         assertSameOrigin(req);
@@ -3530,6 +3601,100 @@ app.post('/api/complete-backup', backupLimiter, async (req, res) => {
             success: false,
             error: message
         });
+    }
+});
+
+// =============================================================================
+// Abandon an unfinished backup before starting a fresh one.
+// A blockchain-finalizing job is never abandoned here: it must first be
+// reconciled, because a submitted transaction may still be mined.
+// =============================================================================
+
+app.post('/api/abandon-backup', backupLimiter, async (req, res) => {
+    try {
+        assertSameOrigin(req);
+        if (!requireGithubSession(req, res)) return;
+
+        const { jobId } = req.body;
+        if (!validateJobId(jobId)) {
+            return res.status(400).json({ success: false, error: 'Nederīgs job ID.' });
+        }
+
+        return await withJobLock(jobId, async ({ lockSignal, lockToken }) => {
+            throwIfLockLost(lockSignal);
+            const job = await getJob(jobId);
+            if (!job) {
+                return res.json({ success: true, missing: true, abandoned: false });
+            }
+            const wallet = await verifyJobAuthorization(req, job);
+            throwIfLockLost(lockSignal);
+
+            if (job.status === 'completed' || job.status === 'failed') {
+                await clearJobOwnerLookup(job);
+                return res.json({ success: true, status: job.status, alreadyTerminal: true });
+            }
+
+            if (job.backupTxHash) {
+                return res.status(409).json({
+                    success: false,
+                    recoveryRequired: true,
+                    error: 'Blockchain transakcijai jau ir zināms hash. Vispirms pabeidz vai atjauno šo transakciju, pēc tam vari sākt jaunu backupu.'
+                });
+            }
+
+            if (job.status === 'blockchain-finalizing') {
+                // The browser may have closed after broadcast but before it
+                // received/stored tx.hash. Only abandon if the exact backup
+                // is not already on-chain and the wallet has no pending nonce.
+                if (!job.tokenId || !job.backupNumber || !job.manifestURI) {
+                    return res.status(409).json({
+                        success: false,
+                        recoveryRequired: true,
+                        error: 'Blockchain finalizācijai trūkst datu. Vispirms jāatjauno nepabeigtais backups.'
+                    });
+                }
+                const provider = getProvider();
+                const nft = new ethers.Contract(NFT_ADDRESS, NFT_ABI, provider);
+                const [onChainCount, onChainManifest, latestNonce, pendingNonce] = await Promise.all([
+                    nft.getBackupCount(BigInt(job.tokenId)),
+                    nft.getManifestURI(BigInt(job.tokenId)),
+                    provider.getTransactionCount(wallet, 'latest'),
+                    provider.getTransactionCount(wallet, 'pending')
+                ]);
+                throwIfLockLost(lockSignal);
+
+                if (onChainCount >= BigInt(job.backupNumber) || onChainManifest === job.manifestURI) {
+                    return res.status(409).json({
+                        success: false,
+                        recoveryRequired: true,
+                        error: 'Šis backups jau ir reģistrēts blockchain. Vispirms jāatjauno tā pabeigšana.'
+                    });
+                }
+                if (pendingNonce > latestNonce) {
+                    return res.status(409).json({
+                        success: false,
+                        recoveryRequired: true,
+                        error: 'Makam ir neapstiprināta blockchain transakcija. Sagaidi tās atrisināšanu un tad sāc jaunu backupu.'
+                    });
+                }
+            }
+
+            throwIfLockLost(lockSignal);
+            const abandoned = await updateJob(jobId, {
+                status: 'failed',
+                error: 'Lietotājs izvēlējās sākt jaunu backupu.',
+                failedAt: Date.now(),
+                abandonedByUser: true,
+                updatedAt: Date.now()
+            }, undefined, { lockToken });
+            await clearJobOwnerLookup(abandoned);
+
+            return res.json({ success: true, status: 'failed', abandoned: true });
+        });
+    } catch (error) {
+        const message = errorMessage(error);
+        const status = /nav atrasts|nav github|nepieder|nederīgs|nederīga state|slēdzene/i.test(message) ? 400 : 500;
+        return res.status(status).json({ success: false, error: message });
     }
 });
 

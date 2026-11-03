@@ -2291,11 +2291,21 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
                     String(existingRecoveryJob.walletAddress).toLowerCase() !== normalizedWallet.toLowerCase()) {
                     return res.status(403).json({ success: false, error: 'Atkopšanas job neatbilst šim repozitorijam vai makam.' });
                 }
-                return res.status(409).json({
-                    success: false,
-                    error: 'Atkopšanas job jau eksistē Redis. Atjauno to pēc esošā job ID.',
-                    jobId: requestedRecoveryJobId
-                });
+
+                // ✅ Tikai nepabeikti job ir jāatjauno. Completed un failed job
+                // nozīmē, ka iepriekšējais backups ir pabeigts vai neizdevies,
+                // un lietotājam ir jāļauj sākt jaunu backupu ar jaunu ID.
+                const isUnfinished = !['completed', 'failed'].includes(existingRecoveryJob.status);
+
+                if (isUnfinished) {
+                    return res.status(409).json({
+                        success: false,
+                        error: 'Atkopšanas job jau eksistē Redis. Atjauno to pēc esošā job ID.',
+                        jobId: requestedRecoveryJobId
+                    });
+                }
+
+                console.log(`ℹ️ Atkopšanas job ${requestedRecoveryJobId} ir ${existingRecoveryJob.status} — ļaujam sākt jaunu backupu.`);
             }
         }
         const now = Date.now();

@@ -25,7 +25,7 @@ const read = relative => fs.readFileSync(path.join(root, relative), 'utf8');
 
 const server = read('server.js');
 const client = read('src/BackupPage.jsx');
-const contract = read('public/contracts/50-5-PermRepoNFT.sol');
+const contract = read('public/contracts/60-1-PermRepoNFT.sol');
 
 function route(source, marker, nextMarker) {
   const start = source.indexOf(marker);

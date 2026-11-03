@@ -82,9 +82,10 @@ test('BC03 — pēc wallet tx.hash saņemšanas tas tiek saglabāts localStorage
 // 4. Pēc pārlūka aizvēršanas hash var būt Redis vai localStorage.
 test('BC04 — recovery atrod blockchain transakciju gan Redis, gan localStorage kontrolpunktā', () => {
   assert.match(client, /jobStatus\.status === 'blockchain-finalizing'[\s\S]{0,160}jobStatus\.backupTxHash/);
-  assert.match(client, /jobStatus\.status === 'blockchain-finalizing'[\s\S]{0,240}!jobStatus\.backupTxHash[\s\S]{0,180}storedBackupTx/);
+  assert.match(client, /jobStatus\.status === 'blockchain-finalizing'[\s\S]{0,180}!jobStatus\.backupTxHash/);
+  assert.match(client, /backupTxHash: storedBackupTx \|\| null/);
   assert.match(client, /apiJson\('\/api\/complete-backup'/);
-  assert.match(client, /const txHash = recoveredJobData\?\.backupTxHash \|\|\s*localStorage\.getItem/);
+  assert.match(client, /let txHash = recoveredJobData\?\.backupTxHash \|\|\s*localStorage\.getItem/);
 });
 
 // 5. Viena un tā pati transakcija ir idempotenta; cits hash tiek noraidīts.
@@ -115,9 +116,13 @@ test('BC07 — NFT līgums aizsargā backup ierakstu ar backupNumber un nonce', 
   assert.match(contract, /nonces\[tokenId\]/);
 });
 
-// Šis ir sagaidāmais uzvedības tests, kas pašreizējā kodā vēl nav izpildāms:
-// ja servera statuss ir blockchain-finalizing, bet tx hash nav ne Redis, ne
-// localStorage, klientam nav droša tx hash, ko nodot complete-backup. Šo testu
-// aktivizēsim tikai pēc tam, kad būs izstrādāta nepabeigtas parakstīšanas
-// atkopšanas loģika; nedrīkst akli atkārtoti izsaukt addBackup.
-test.todo('BC08 — pēc pārlūka aizvēršanas blockchain-finalizing bez txHash droši atsāk parakstīšanu/nosūtīšanu');
+test('BC08 — blockchain-finalizing bez txHash meklē precīzu BackupAdded notikumu un tikai tad atver drošu atkārtotu parakstīšanu', () => {
+  assert.match(client, /provider\.getLogs\(/, 'Klients nemeklē jau iesniegtu BackupAdded transakciju.');
+  assert.match(client, /manifestHash\.toLowerCase\(\) === recoveredJobData\.manifestHash/);
+  assert.match(client, /manifestURI === recoveredJobData\.manifestURI/);
+  assert.match(client, /\/api\/save-backup-tx/);
+  assert.match(client, /\/api\/reopen-blockchain-finalize/);
+  assert.match(server, /app\.post\('\/api\/reopen-blockchain-finalize'/);
+  assert.match(server, /onChainCount >= BigInt\(job\.backupNumber\)/);
+  assert.match(server, /status: 'manifest-uploaded'/);
+});

@@ -1,4 +1,3 @@
-
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -448,4 +447,37 @@ test('P27 — galvenā lapa atrod nepabeigtu backup Redis arī bez localStorage 
   assert.match(app, /walletAddress=\$\{encodeURIComponent\(userAddress\)\}/, 'Redis meklēšanai netiek izmantots pieslēgtais maks.');
   assert.match(app, /localStorage\.setItem\(`permrepo-job-\$\{repoKey\}`, storedJobId\)/, 'Atrastais Redis jobId netiek saglabāts kā lokāls rezerves kontrolpunkts.');
   assert.match(app, /jobStatus\.zipTxId \|\| jobStatus\.manifestTxId \|\| jobStatus\.backupTxHash/, 'Nepabeigts backup netiek atpazīts pēc ZIP/manifesta/transakcijas kontrolpunkta.');
+});
+
+// ✅ Jauns tests: REQUIRE_ANS104_LOCATION vides mainīgais
+test('P28 — REQUIRE_ANS104_LOCATION vides mainīgais kontrolē ANS-104 pārbaudi (devnet/mainnet)', () => {
+  const server = read('server.js');
+
+  // Vides mainīgā definīcija
+  assert.match(
+    server,
+    /REQUIRE_ANS104_LOCATION\s*=\s*process\.env\.REQUIRE_ANS104_LOCATION\s*===\s*['"]true['"]/,
+    'Trūkst REQUIRE_ANS104_LOCATION vides mainīgā definīcijas.'
+  );
+
+  // Pārbaude verifyArweaveDataItem iekšpusē — ja false, atgriež false, nevis met kļūdu
+  assert.match(
+    server,
+    /if\s*\(!REQUIRE_ANS104_LOCATION\)\s*\{[\s\S]*?return false;/,
+    'Trūkst REQUIRE_ANS104_LOCATION pārbaudes verifyArweaveDataItem iekšpusē.'
+  );
+
+  // Pārbaude loadPreviousManifest iekšpusē — pārbauda atgriezto vērtību
+  assert.match(
+    server,
+    /ans104Verified\s*===\s*false/,
+    'Trūkst ans104Verified atgrieztās vērtības pārbaudes loadPreviousManifest iekšpusē.'
+  );
+
+  // Brīdinājuma ziņojums, kad pārbaude izlaista
+  assert.match(
+    server,
+    /ANS-104 datu vienuma verifikācija izlaista/,
+    'Trūkst brīdinājuma ziņojuma, kad ANS-104 pārbaude tiek izlaista.'
+  );
 });

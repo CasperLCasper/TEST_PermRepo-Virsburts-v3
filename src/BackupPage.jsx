@@ -264,7 +264,7 @@ function BackupPage() {
             messageEl.style.cssText = 'color:#b0b8c4;margin-bottom:24px;line-height:1.5;font-size:14px;';
             const yesButton = document.createElement('button');
             yesButton.textContent = yesLabel;
-            yesButton.style.cssText = 'width:100%;padding:12px;background:#f85149;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer;margin-bottom:8px;font-weight:600;';
+            yesButton.style.cssText = 'width:100%;padding:12px;background:#238636;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer;margin-bottom:8px;font-weight:600;';
             const noButton = document.createElement('button');
             noButton.textContent = noLabel;
             noButton.style.cssText = 'width:100%;padding:12px;background:#30363d;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer;';

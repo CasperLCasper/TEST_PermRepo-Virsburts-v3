@@ -13,7 +13,7 @@
     --green: #3fb950;
     --green-gradient: linear-gradient(135deg, #238636 0%, #2ea043 100%);
     --red: #f85149;
-    --radius: 12px;
+    --radius: 10px;
     --transition: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
 }
 

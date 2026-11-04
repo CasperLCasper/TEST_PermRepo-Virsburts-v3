@@ -75,6 +75,47 @@ function App() {
         return result;
     }, [t]);
 
+    // ✅ 3. LABOJUMS: Apstiprinājuma dialogs
+    const showConfirmDialog = useCallback((title, message, yesLabel, noLabel) => {
+        return new Promise(resolve => {
+            const overlay = document.createElement('div');
+            overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.8);display:flex;justify-content:center;align-items:center;z-index:1000;padding:20px;';
+            const box = document.createElement('div');
+            box.style.cssText = 'background:#161b22;border:1px solid #30363d;border-radius:12px;padding:32px;max-width:480px;width:100%;box-sizing:border-box;';
+            const titleEl = document.createElement('h2');
+            titleEl.textContent = title;
+            titleEl.style.cssText = 'color:#79c0ff;margin-bottom:16px;font-size:20px;';
+            const messageEl = document.createElement('p');
+            messageEl.textContent = message;
+            messageEl.style.cssText = 'color:#b0b8c4;margin-bottom:24px;line-height:1.5;font-size:14px;';
+            const yesButton = document.createElement('button');
+            yesButton.textContent = yesLabel;
+            yesButton.style.cssText = 'width:100%;padding:12px;background:#f85149;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer;margin-bottom:8px;font-weight:600;';
+            const noButton = document.createElement('button');
+            noButton.textContent = noLabel;
+            noButton.style.cssText = 'width:100%;padding:12px;background:#30363d;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer;';
+            box.appendChild(titleEl);
+            box.appendChild(messageEl);
+            box.appendChild(yesButton);
+            box.appendChild(noButton);
+            overlay.appendChild(box);
+            document.body.appendChild(overlay);
+
+            const cleanup = () => { overlay.remove(); };
+            yesButton.onclick = () => { cleanup(); resolve(true); };
+            noButton.onclick = () => { cleanup(); resolve(false); };
+            overlay.onclick = (e) => { if (e.target === overlay) { cleanup(); resolve(false); } };
+            document.addEventListener('keydown', function onEsc(e) {
+                if (e.key === 'Escape') {
+                    document.removeEventListener('keydown', onEsc);
+                    cleanup();
+                    resolve(false);
+                }
+            });
+            noButton.focus();
+        });
+    }, []);
+
     const checkSubscription = useCallback(async () => {
         try {
             const data = await apiJson('/api/subscription/status');
@@ -86,8 +127,7 @@ function App() {
         }
     }, [apiJson]);
 
-    // Nepabeigta backup pārbaude: vispirms meklējam Redis pēc lietotāja,
-    // repozitorija un maka. localStorage jobId ir tikai rezerves ceļš.
+    // Nepabeigta backup pārbaude
     const checkUnfinishedBackup = useCallback(async (repoName) => {
         if (!repoName) {
             setUnfinishedBackup(null);
@@ -114,8 +154,6 @@ function App() {
                 localStorage.setItem(`permrepo-job-${repoKey}`, storedJobId);
             }
         } catch (lookupError) {
-            // 404 nozīmē, ka Redis nav nepabeigta job; citām kļūdām
-            // izmantojam localStorage tikai kā rezerves atkopšanas norādi.
             if (lookupError.status !== 404) {
                 console.error('Neizdevās meklēt nepabeigtu backup Redis:', lookupError);
                 if (!storedJobId) {
@@ -152,8 +190,6 @@ function App() {
                 return;
             }
 
-            // Nepabeigtu backup atpazīstam pēc jebkura jau saglabāta
-            // augšupielādes kontrolpunkta, ne tikai pēc ZIP ID.
             if (jobStatus.zipTxId || jobStatus.manifestTxId || jobStatus.backupTxHash) {
                 setUnfinishedBackup({
                     jobId: storedJobId,
@@ -182,7 +218,6 @@ function App() {
         }
     }, [apiJson, reposData, userAddress, t]);
 
-    // ✅ Kad lietotājs izvēlas repo → pārbauda nepabeigtu backupu
     useEffect(() => {
         if (selectedRepoName) {
             checkUnfinishedBackup(selectedRepoName);
@@ -214,10 +249,6 @@ function App() {
             const subscribeTx = await subscriptionContract.connect(providerSigner).subscribe(githubHash);
             await subscribeTx.wait();
 
-            // Pēc apstiprinātas transakcijas uzreiz pārbaudām abonementu caur
-            // lietotāja maka RPC. Servera RPC var īslaicīgi atpalikt, tāpēc
-            // tūlītējs /api/subscription/status pieprasījums var atgriezt false
-            // un atstāt platformas UI ar neaktīvu abonementu.
             let confirmedSubscription = null;
             for (let attempt = 0; attempt < 6; attempt += 1) {
                 const [isSubscribed, expiry, remainingTime] = await Promise.all([
@@ -248,7 +279,6 @@ function App() {
                 throw new Error('Abonementa transakcija ir apstiprināta, bet tā statusu vēl nevar nolasīt no blokķēdes. Lūdzu, pēc dažām sekundēm mēģini vēlreiz pārbaudīt abonementu.');
             }
 
-            // Atjaunojam React state uzreiz — lapas manuāla pārlāde nav vajadzīga.
             setSubscriptionStatus(confirmedSubscription);
             setStatus(t('subscription-purchased'));
             setStatusType('success');
@@ -474,6 +504,37 @@ function App() {
             setIsSigningForBackup(false);
         }
     }, [config, userAddress, navigate, t, subscriptionStatus]);
+
+    // ✅ 3. LABOJUMS: Sākt jaunu backupu no galvenās lapas ar apstiprinājumu
+    const startNewBackupFromMain = useCallback(async (repo) => {
+        const confirmed = await showConfirmDialog(
+            t('confirm-start-new-backup-title'),
+            t('confirm-start-new-backup-message'),
+            t('confirm-start-new-backup-yes'),
+            t('confirm-start-new-backup-no')
+        );
+        if (!confirmed) return;
+
+        const repoKey = repo.id != null ? String(repo.id) : repo.name;
+        try {
+            localStorage.removeItem(`permrepo-job-${repoKey}`);
+            localStorage.removeItem(`permrepo-backup-tx-${repoKey}`);
+            localStorage.removeItem(`permrepo-recovery-${repoKey}`);
+        } catch {}
+
+        setUnfinishedBackup(null);
+        navigate(`/backup?repo=${encodeURIComponent(repo.name)}&repoId=${repo.id}&repoFullName=${encodeURIComponent(repo.full_name)}`, {
+            state: {
+                walletAddress: userAddress,
+                repositoryId: String(repo.id),
+                repositoryFullName: repo.full_name,
+                nftTokenId: repo.tokenId,
+                backupCount: repo.backupCount,
+                lastManifest: repo.lastManifest,
+                lastMerkleRoot: repo.lastMerkleRoot
+            }
+        });
+    }, [showConfirmDialog, t, navigate, userAddress]);
 
     useEffect(() => {
         if (lastStatusData && lastStatusData.type === 'wallet-connected' && walletConnected) {
@@ -728,10 +789,30 @@ function App() {
                                 {selectedRepo.hasNFT ? (selectedRepo.nftOwnedByWallet ? t('nft-linked') : t('nft-not-owned')) : t('no-nft')}
                             </div>
                             
-                            {/* ✅ Nepabeigta backupa paziņojums */}
+                            {/* ✅ 3. LABOJUMS: Nepabeigta backupa paziņojums ar divām pogām */}
                             {hasUnfinishedBackup && (
                                 <div className="unfinished-backup-warning">
                                     {t('unfinished-backup-warning')}
+                                    <div className="unfinished-backup-actions">
+                                        <button
+                                            onClick={() => createBackup(selectedRepo)}
+                                            className="sign-button"
+                                            style={{
+                                                background: 'linear-gradient(135deg, #238636 0%, #1a6b2a 100%)',
+                                                border: '1px solid #2ea043',
+                                                color: '#fff',
+                                                fontWeight: '600'
+                                            }}
+                                        >
+                                            {t('finish-previous-backup')}
+                                        </button>
+                                        <button
+                                            onClick={() => startNewBackupFromMain(selectedRepo)}
+                                            className="sign-button start-new-backup-btn"
+                                        >
+                                            {t('start-new-backup')}
+                                        </button>
+                                    </div>
                                 </div>
                             )}
                             
@@ -745,16 +826,7 @@ function App() {
                                     {t('subscription-required')}
                                 </div>
                             ) : selectedRepo.hasNFT && selectedRepo.nftOwnedByWallet ? (
-                                hasUnfinishedBackup ? (
-                                    // ✅ Nepabeigts backups → "Pabeigt iepriekšējo backup"
-                                    <button 
-                                        onClick={() => createBackup(selectedRepo)}
-                                        className="sign-button sign-button-warning"
-                                    >
-                                        {t('finish-previous-backup')}
-                                    </button>
-                                ) : (
-                                    // ✅ Nav nepabeigta → "Izveidot Backup"
+                                hasUnfinishedBackup ? null : (
                                     <button 
                                         onClick={() => createBackup(selectedRepo)}
                                         className="sign-button"

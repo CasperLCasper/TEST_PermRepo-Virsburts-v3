@@ -75,7 +75,6 @@ function App() {
         return result;
     }, [t]);
 
-    // ✅ 3. LABOJUMS: Apstiprinājuma dialogs
     const showConfirmDialog = useCallback((title, message, yesLabel, noLabel) => {
         return new Promise(resolve => {
             const overlay = document.createElement('div');
@@ -127,7 +126,6 @@ function App() {
         }
     }, [apiJson]);
 
-    // Nepabeigta backup pārbaude
     const checkUnfinishedBackup = useCallback(async (repoName) => {
         if (!repoName) {
             setUnfinishedBackup(null);
@@ -505,7 +503,6 @@ function App() {
         }
     }, [config, userAddress, navigate, t, subscriptionStatus]);
 
-    // ✅ 3. LABOJUMS: Sākt jaunu backupu no galvenās lapas ar apstiprinājumu
     const startNewBackupFromMain = useCallback(async (repo) => {
         const confirmed = await showConfirmDialog(
             t('confirm-start-new-backup-title'),
@@ -789,7 +786,6 @@ function App() {
                                 {selectedRepo.hasNFT ? (selectedRepo.nftOwnedByWallet ? t('nft-linked') : t('nft-not-owned')) : t('no-nft')}
                             </div>
                             
-                            {/* ✅ 3. LABOJUMS: Nepabeigta backupa paziņojums ar divām pogām */}
                             {hasUnfinishedBackup && (
                                 <div className="unfinished-backup-warning">
                                     {t('unfinished-backup-warning')}

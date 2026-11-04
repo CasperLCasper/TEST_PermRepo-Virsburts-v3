@@ -514,6 +514,19 @@ function App() {
 
         const repoKey = repo.id != null ? String(repo.id) : repo.name;
         try {
+            const oldJobId = localStorage.getItem(`permrepo-job-${repoKey}`);
+            if (oldJobId) {
+                try {
+                    await apiJson('/api/delete-job', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ jobId: oldJobId })
+                    });
+                } catch (deleteError) {
+                    console.warn('Neizdevās dzēst job:', deleteError);
+                }
+            }
+
             localStorage.removeItem(`permrepo-job-${repoKey}`);
             localStorage.removeItem(`permrepo-backup-tx-${repoKey}`);
             localStorage.removeItem(`permrepo-recovery-${repoKey}`);
@@ -531,7 +544,7 @@ function App() {
                 lastMerkleRoot: repo.lastMerkleRoot
             }
         });
-    }, [showConfirmDialog, t, navigate, userAddress]);
+    }, [showConfirmDialog, t, navigate, userAddress, apiJson]);
 
     useEffect(() => {
         if (lastStatusData && lastStatusData.type === 'wallet-connected' && walletConnected) {
@@ -824,10 +837,10 @@ function App() {
                             ) : selectedRepo.hasNFT && selectedRepo.nftOwnedByWallet ? (
                                 hasUnfinishedBackup ? null : (
                                     <button 
-                                        onClick={() => createBackup(selectedRepo)}
-                                        className="sign-button"
+                                        onClick={() => startNewBackupFromMain(selectedRepo)}
+                                        className="sign-button start-new-backup-btn"
                                     >
-                                        {t('open-backup')}
+                                        {t('start-new-backup')}
                                     </button>
                                 )
                             ) : selectedRepo.hasNFT && !selectedRepo.nftOwnedByWallet ? (

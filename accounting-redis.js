@@ -94,6 +94,35 @@ export async function findJobByOwner(githubUserId, repositoryId, walletAddress) 
     }
 }
 
+/**
+ * Dzēš job no Redis un notīra job owner lookup.
+ * Šī funkcija ir paredzēta, lai lietotājs varētu pilnībā izkļūt no
+ * jebkura stāvokļa (reset).
+ */
+export async function deleteJob(jobId) {
+    const client = requireRedis();
+
+    if (typeof jobId !== 'string' || !/^[a-f0-9-]{20,100}$/i.test(jobId)) {
+        throw new Error('Nederīgs jobId.');
+    }
+
+    try {
+        const job = await getJob(jobId);
+        await client.del(jobKey(jobId));
+        if (job) {
+            try {
+                await clearJobOwnerLookup(job);
+            } catch (indexError) {
+                console.error('Redis job owner lookup dzēšana neizdevās:', indexError);
+            }
+        }
+        return true;
+    } catch (error) {
+        console.error('Redis deleteJob kļūda:', error);
+        throw new Error('Backup job dzēšana neizdevās.');
+    }
+}
+
 // -----------------------------------------------------------------------------
 // TTL noteikšana pēc job stāvokļa
 // -----------------------------------------------------------------------------

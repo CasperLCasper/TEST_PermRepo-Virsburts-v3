@@ -250,7 +250,6 @@ function BackupPage() {
         return ethers.hexlify(new Uint8Array(signature));
     }, [deriveSubkeyBytes]);
 
-    // ✅ JAUNS: Apstiprinājuma dialogs "Sākt jaunu backupu"
     const showConfirmDialog = useCallback((title, message, yesLabel, noLabel) => {
         return new Promise(resolve => {
             const overlay = document.createElement('div');
@@ -303,7 +302,6 @@ function BackupPage() {
             const input = document.createElement('input');
             input.type = 'password';
             input.placeholder = t('enter-key');
-            // ✅ 2. LABOJUMS: Noņemts zilais rāmis
             input.style.cssText = 'width:100%;padding:12px;background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#e6edf3;font-size:16px;margin-bottom:16px;box-sizing:border-box;outline:none;box-shadow:none;';
             input.addEventListener('focus', () => {
                 input.style.borderColor = '#30363d';
@@ -499,8 +497,6 @@ function BackupPage() {
                 let storedBackupTx = localStoredBackupTx;
                 let recoveryJobIdForPrepare = null;
 
-                // Redis is the primary source. localStorage is consulted only as
-                // a fallback when Redis has no indexed job for this owner/repo/wallet.
                 try {
                     const redisRecovery = await apiJson(
                         `/api/recover-job?repositoryId=${encodeURIComponent(repositoryId)}&walletAddress=${encodeURIComponent(currentAddress)}`
@@ -1040,7 +1036,6 @@ function BackupPage() {
         readRecoveryJournal, updateRecoveryJournal, clearRecoveryJournal
     ]);
 
-    // ✅ 1. LABOJUMS: Pievienots apstiprinājums pirms jauna backupa sākšanas
     const startFreshBackup = useCallback(async () => {
         const confirmed = await showConfirmDialog(
             t('confirm-start-new-backup-title'),
@@ -2072,30 +2067,36 @@ function BackupPage() {
                 </>
             )}
             
-            {!backupCompleted && !recoveredJobData?.freshStartRequired && (recoveryRequired && !recoveredJobData?.serverJobMissing && (recoveredJobData?.backupTxHash || localStorage.getItem(`permrepo-backup-tx-${repoStorageKey}`)) ? (
-                <button
-                    onClick={recoverBackup}
-                    disabled={isWorking}
-                    className="sign-button"
-                    style={{ marginTop: '20px', background: 'linear-gradient(135deg, #f0ad4e 0%, #d98b3a 100%)' }}
-                >
-                    {isWorking ? <div className="spinner"></div> : t('recover-backup')}
-                </button>
-            ) : (
-                <button
-                    onClick={continueBackup}
-                    disabled={
-                        isWorking ||
-                        fileInfo.loading ||
-                        (fileInfo.count === 0 && !recoveredJobData) ||
-                        (recoveryRequired && (recoveredJobData?.serverJobMissing || !(recoveredJobData?.backupTxHash || localStorage.getItem(`permrepo-backup-tx-${repoStorageKey}`))))
-                    }
-                    className="sign-button"
-                    style={{ marginTop: '20px' }}
-                >
-                    {isWorking ? <div className="spinner"></div> : t('continue-backup')}
-                </button>
-            ))}
+            {!backupCompleted && !recoveredJobData?.freshStartRequired && (
+                recoveryRequired && !recoveredJobData?.serverJobMissing && (recoveredJobData?.backupTxHash || localStorage.getItem(`permrepo-backup-tx-${repoStorageKey}`)) ? (
+                    <button
+                        onClick={recoverBackup}
+                        disabled={isWorking}
+                        className="sign-button"
+                        style={{ marginTop: '20px', background: 'linear-gradient(135deg, #f0ad4e 0%, #d98b3a 100%)' }}
+                    >
+                        {isWorking ? <div className="spinner"></div> : t('recover-backup')}
+                    </button>
+                ) : recoveredJobData ? (
+                    <button
+                        onClick={continueBackup}
+                        disabled={isWorking || fileInfo.loading}
+                        className="sign-button"
+                        style={{ marginTop: '20px' }}
+                    >
+                        {isWorking ? <div className="spinner"></div> : t('continue-existing-backup')}
+                    </button>
+                ) : (
+                    <button
+                        onClick={continueBackup}
+                        disabled={isWorking || fileInfo.loading || fileInfo.count === 0}
+                        className="sign-button"
+                        style={{ marginTop: '20px' }}
+                    >
+                        {isWorking ? <div className="spinner"></div> : t('continue-backup')}
+                    </button>
+                )
+            )}
 
             {backupCompleted && (
                 <button
@@ -2107,7 +2108,6 @@ function BackupPage() {
                 </button>
             )}
 
-            {/* ✅ 4. LABOJUMS: "Sākt jaunu backupu" poga — oranžs gradients */}
             <button
                 onClick={startFreshBackup}
                 disabled={isWorking}

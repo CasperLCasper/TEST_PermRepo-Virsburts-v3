@@ -21,6 +21,7 @@ import {
     getRedis,
     createJob,
     getJob,
+    deleteJob,
     findJobByOwner,
     clearJobOwnerLookup,
     updateJob,
@@ -39,8 +40,6 @@ app.set('trust proxy', 1);
 
 const PORT = Number(process.env.PORT || 3000);
 const ARWEAVE_GATEWAY = process.env.ARWEAVE_GATEWAY || '';
-// ANS-104 offsets are resolved through an AR.IO gateway even when manifest
-// content is served by the classic arweave.net gateway.
 const AR_IO_GATEWAY = process.env.AR_IO_GATEWAY || 'https://ar-io.dev';
 const CHAIN_ID = process.env.CHAIN_ID || '';
 const RPC_URL = process.env.RPC_URL || '';
@@ -56,9 +55,6 @@ const TURBO_PAYMENT_URL = process.env.TURBO_PAYMENT_URL || '';
 const MINT_AUTHORIZATION_SIGNER_PRIVATE_KEY =
     process.env.MINT_AUTHORIZATION_SIGNER_PRIVATE_KEY || '';
 
-// ✅ ANS-104 atrašanās vietas pārbaudes ieslēgšana/izslēgšana
-// Devnet: false (vārteja var neatbalstīt /ar-io/offsets/)
-// Mainnet: true (pilna kriptogrāfiskā verifikācija)
 const REQUIRE_ANS104_LOCATION = process.env.REQUIRE_ANS104_LOCATION === 'true';
 
 const MAX_REPO_FILES = Number(process.env.MAX_REPO_FILES || 5000);
@@ -491,7 +487,6 @@ const mintAuthorizationSigner = new ethers.Wallet(
     MINT_AUTHORIZATION_SIGNER_PRIVATE_KEY
 );
 
-// ✅ P1-1: Aprēķina Merkle sakni no archive.contains
 function calculateArchiveMerkleRoot(contains) {
     if (!Array.isArray(contains)) {
         throw new Error('archive.contains nav masīvs.');
@@ -576,7 +571,6 @@ async function readJsonResponseWithLimit(response, maxBytes) {
     return JSON.parse(bytes.toString('utf8'));
 }
 
-// ✅ Jauna palīgfunkcija: fetch ar retry
 async function fetchWithRetry(url, options, attempts = 3, label = 'Pieprasījums') {
     let lastError;
     for (let i = 0; i < attempts; i++) {
@@ -585,7 +579,6 @@ async function fetchWithRetry(url, options, attempts = 3, label = 'Pieprasījums
             if (response.ok) return response;
 
             lastError = new Error(`HTTP ${response.status}`);
-            // Ja 4xx (izņemot 429), nav jēgas atkārtot
             if (response.status >= 400 && response.status < 500 && response.status !== 429) {
                 return response;
             }
@@ -676,7 +669,6 @@ async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchI
                     }
                 });
             } catch (error) {
-                // ✅ Ja REQUIRE_ANS104_LOCATION=false, izlaižam pārbaudi, nevis metam kļūdu
                 if (!REQUIRE_ANS104_LOCATION) {
                     console.warn(`⚠️ ANS-104 atrašanās vietas pārbaude izlaista (REQUIRE_ANS104_LOCATION=false). Iemesls: offsets (${offsetsError || 'nederīga atbilde'}) un HEAD /raw neizdevās (${error?.name === 'TimeoutError' ? 'taimauts' : 'tīkla kļūda'}).`);
                     return false;
@@ -696,7 +688,6 @@ async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchI
             try { await headResponse?.body?.cancel(); } catch {}
         }
         if (!location) {
-            // ✅ Ja REQUIRE_ANS104_LOCATION=false, izlaižam pārbaudi, nevis metam kļūdu
             if (!REQUIRE_ANS104_LOCATION) {
                 console.warn(`⚠️ ANS-104 atrašanās vietas pārbaude izlaista (REQUIRE_ANS104_LOCATION=false). Iemesls: offsets (${offsetsError || 'atrašanās vieta nav indeksēta'}) un HEAD /raw galvenes nav pietiekamas.`);
                 return false;
@@ -734,9 +725,7 @@ async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchI
     return true;
 }
 
-// ✅ LABOTS: loadPreviousManifest ar retry, redirect: 'follow', lielāku timeout
 async function loadPreviousManifest(lastManifest) {
-    // Tukša vērtība nozīmē, ka šim NFT vēl nav veikts backup.
     if (lastManifest === '') {
         return null;
     }
@@ -754,11 +743,6 @@ async function loadPreviousManifest(lastManifest) {
         const manifestUrl = getValidatedManifestUrl(prevManifestId);
         console.log(`📥 Ielādē iepriekšējo manifestu: ${manifestUrl}`);
 
-        // ✅ Labojumi:
-        // - redirect: 'follow' (ļauj sekot ar.io pāradresācijai uz sandbox apakšdomēnu)
-        // - AbortSignal.timeout(60000) (60s nevis 30s)
-        // - User-Agent un Accept galvenes
-        // - retry 3 mēģinājumi
         const response = await fetchWithRetry(manifestUrl, {
             cache: 'default',
             redirect: 'follow',
@@ -773,14 +757,11 @@ async function loadPreviousManifest(lastManifest) {
             throw new Error(`Iepriekšējā manifesta ielāde neizdevās (HTTP ${response.status}).`);
         }
 
-        // Read once, then authenticate the exact bytes against the signed
-        // ANS-104 DataItem before trusting any manifest field.
         const manifestBytes = await readResponseBytesWithLimit(
             response,
             MAX_MANIFEST_BYTES,
             'Iepriekšējais manifests'
         );
-        // ✅ Pārbaudām atgriezto vērtību — ja false, ANS-104 pārbaude izlaista
         const ans104Verified = await verifyArweaveDataItem(response, manifestBytes, prevManifestId, fetch, AR_IO_GATEWAY);
         if (ans104Verified === false) {
             console.warn('⚠️ ANS-104 datu vienuma verifikācija izlaista — turpinām ar manifesta strukturālo validāciju un Merkle root pārbaudi.');
@@ -2252,8 +2233,6 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
         }
 
         const previousManifest = await loadPreviousManifest(lastManifest);
-        // Internal deletion metadata is not a GitHub repository file and must
-        // not be treated as a file deleted by the next backup.
         const previousPaths = Object.create(null);
         if (
             previousManifest &&
@@ -2268,9 +2247,6 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
             }
         }
 
-        // Empty repositories are valid when the previous manifest has files:
-        // the backup client will create a deletion-marker-only ZIP. Reject only
-        // a repository that is empty and has no prior state to back up.
         if (archiveMetadata.blobs.length === 0 && Object.keys(previousPaths).length === 0) {
             return res.status(400).json({
                 success: false,
@@ -2292,10 +2268,6 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
                     return res.status(403).json({ success: false, error: 'Atkopšanas job neatbilst šim repozitorijam vai makam.' });
                 }
 
-                // ✅ Tikai job ar augšupielādētu ZIP/manifestu/transakciju ir
-                // jāatjauno. 'prepared' bez ZIP, 'completed' un 'failed' nozīmē,
-                // ka iepriekšējais backups nav aktīvi jāatjauno — lietotājam
-                // jāļauj sākt jaunu backupu ar JAUNU jobId.
                 const hasUploadedArtifact = Boolean(
                     existingRecoveryJob.zipTxId ||
                     existingRecoveryJob.manifestTxId ||
@@ -2310,9 +2282,6 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
                     });
                 }
 
-                // ✅ Vecais job ir 'prepared' bez augšupielādēta ZIP — tas ir
-                // "tukšs". Sākam jaunu backupu ar JAUNU jobId, lai izvairītos
-                // no 'Job ar šādu ID jau eksistē' kļūdas createJob().
                 jobId = crypto.randomUUID();
                 console.log(`ℹ️ Atkopšanas job ${requestedRecoveryJobId} (${existingRecoveryJob.status}) bez augšupielādēta ZIP — sākam jaunu backupu ar jaunu jobId ${jobId}.`);
             }
@@ -3643,12 +3612,10 @@ app.post('/api/complete-backup', backupLimiter, async (req, res) => {
 });
 
 // =============================================================================
-// Abandon an unfinished backup before starting a fresh one.
-// A blockchain-finalizing job is never abandoned here: it must first be
-// reconciled, because a submitted transaction may still be mined.
+// Delete job — reset poga, kas dzēš job no Redis
 // =============================================================================
 
-app.post('/api/abandon-backup', backupLimiter, async (req, res) => {
+app.post('/api/delete-job', backupLimiter, async (req, res) => {
     try {
         assertSameOrigin(req);
         if (!requireGithubSession(req, res)) return;
@@ -3662,72 +3629,15 @@ app.post('/api/abandon-backup', backupLimiter, async (req, res) => {
             throwIfLockLost(lockSignal);
             const job = await getJob(jobId);
             if (!job) {
-                return res.json({ success: true, missing: true, abandoned: false });
+                return res.json({ success: true, missing: true, deleted: false });
             }
-            const wallet = await verifyJobAuthorization(req, job);
+            await verifyJobAuthorization(req, job);
             throwIfLockLost(lockSignal);
 
-            if (job.status === 'completed' || job.status === 'failed') {
-                await clearJobOwnerLookup(job);
-                return res.json({ success: true, status: job.status, alreadyTerminal: true });
-            }
+            await deleteJob(jobId);
+            await clearJobOwnerLookup(job);
 
-            if (job.backupTxHash) {
-                return res.status(409).json({
-                    success: false,
-                    recoveryRequired: true,
-                    error: 'Blockchain transakcijai jau ir zināms hash. Vispirms pabeidz vai atjauno šo transakciju, pēc tam vari sākt jaunu backupu.'
-                });
-            }
-
-            if (job.status === 'blockchain-finalizing') {
-                // The browser may have closed after broadcast but before it
-                // received/stored tx.hash. Only abandon if the exact backup
-                // is not already on-chain and the wallet has no pending nonce.
-                if (!job.tokenId || !job.backupNumber || !job.manifestURI) {
-                    return res.status(409).json({
-                        success: false,
-                        recoveryRequired: true,
-                        error: 'Blockchain finalizācijai trūkst datu. Vispirms jāatjauno nepabeigtais backups.'
-                    });
-                }
-                const provider = getProvider();
-                const nft = new ethers.Contract(NFT_ADDRESS, NFT_ABI, provider);
-                const [onChainCount, onChainManifest, latestNonce, pendingNonce] = await Promise.all([
-                    nft.getBackupCount(BigInt(job.tokenId)),
-                    nft.getManifestURI(BigInt(job.tokenId)),
-                    provider.getTransactionCount(wallet, 'latest'),
-                    provider.getTransactionCount(wallet, 'pending')
-                ]);
-                throwIfLockLost(lockSignal);
-
-                if (onChainCount >= BigInt(job.backupNumber) || onChainManifest === job.manifestURI) {
-                    return res.status(409).json({
-                        success: false,
-                        recoveryRequired: true,
-                        error: 'Šis backups jau ir reģistrēts blockchain. Vispirms jāatjauno tā pabeigšana.'
-                    });
-                }
-                if (pendingNonce > latestNonce) {
-                    return res.status(409).json({
-                        success: false,
-                        recoveryRequired: true,
-                        error: 'Makam ir neapstiprināta blockchain transakcija. Sagaidi tās atrisināšanu un tad sāc jaunu backupu.'
-                    });
-                }
-            }
-
-            throwIfLockLost(lockSignal);
-            const abandoned = await updateJob(jobId, {
-                status: 'failed',
-                error: 'Lietotājs izvēlējās sākt jaunu backupu.',
-                failedAt: Date.now(),
-                abandonedByUser: true,
-                updatedAt: Date.now()
-            }, undefined, { lockToken });
-            await clearJobOwnerLookup(abandoned);
-
-            return res.json({ success: true, status: 'failed', abandoned: true });
+            return res.json({ success: true, deleted: true });
         });
     } catch (error) {
         const message = errorMessage(error);
@@ -3816,6 +3726,61 @@ app.post('/api/fail-backup', backupLimiter, async (req, res) => {
             success: false,
             error: message
         });
+    }
+});
+
+// =============================================================================
+// Abandon — atstāts savietojamībai, bet delete-job ir ieteicamais
+// =============================================================================
+
+app.post('/api/abandon-backup', backupLimiter, async (req, res) => {
+    try {
+        assertSameOrigin(req);
+        if (!requireGithubSession(req, res)) return;
+
+        const { jobId } = req.body;
+        if (!validateJobId(jobId)) {
+            return res.status(400).json({ success: false, error: 'Nederīgs job ID.' });
+        }
+
+        return await withJobLock(jobId, async ({ lockSignal, lockToken }) => {
+            throwIfLockLost(lockSignal);
+            const job = await getJob(jobId);
+            if (!job) {
+                return res.json({ success: true, missing: true, abandoned: false });
+            }
+            const wallet = await verifyJobAuthorization(req, job);
+            throwIfLockLost(lockSignal);
+
+            if (job.status === 'completed' || job.status === 'failed') {
+                await clearJobOwnerLookup(job);
+                return res.json({ success: true, status: job.status, alreadyTerminal: true });
+            }
+
+            if (job.backupTxHash) {
+                return res.status(409).json({
+                    success: false,
+                    recoveryRequired: true,
+                    error: 'Blockchain transakcijai jau ir zināms hash. Vispirms pabeidz vai atjauno šo transakciju, pēc tam vari sākt jaunu backupu.'
+                });
+            }
+
+            throwIfLockLost(lockSignal);
+            const abandoned = await updateJob(jobId, {
+                status: 'failed',
+                error: 'Lietotājs izvēlējās sākt jaunu backupu.',
+                failedAt: Date.now(),
+                abandonedByUser: true,
+                updatedAt: Date.now()
+            }, undefined, { lockToken });
+            await clearJobOwnerLookup(abandoned);
+
+            return res.json({ success: true, status: 'failed', abandoned: true });
+        });
+    } catch (error) {
+        const message = errorMessage(error);
+        const status = /nav atrasts|nav github|nepieder|nederīgs|nederīga state|slēdzene/i.test(message) ? 400 : 500;
+        return res.status(status).json({ success: false, error: message });
     }
 });
 

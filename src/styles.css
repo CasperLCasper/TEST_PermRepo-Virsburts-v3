@@ -412,9 +412,9 @@ button.start-new-backup-btn {
     box-shadow: 0 2px 8px rgba(217, 119, 6, 0.3) !important;
 
     /* ✅ Izmēri */
-    padding: 14px 24px !important;
+    padding: 16px 24px !important;
     font-size: 16px !important;
-    min-height: 56px !important;
+    min-height: 42px !important;
     width: 100% !important;
 }
 

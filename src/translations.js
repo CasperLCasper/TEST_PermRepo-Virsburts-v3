@@ -8,7 +8,7 @@ export const translations = {
         'connect-wallet': 'Savienot maku',
         repository: 'Repozitorijs',
         'select-repo': 'Izvēlies repozitoriju...',
-        'open-backup': 'Izveidot Backup',
+        'open-backup': 'Izveidot Backup`u',
         'mint-nft': 'Izveidot On-chain Deskriptoru',
         'nft-linked': 'On-chain Deskriptors ir piesaistīts šim repozitorijam',
         'no-nft': 'On-chain Deskriptors vēl nav izveidots',

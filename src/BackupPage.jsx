@@ -250,6 +250,47 @@ function BackupPage() {
         return ethers.hexlify(new Uint8Array(signature));
     }, [deriveSubkeyBytes]);
 
+    // ✅ JAUNS: Apstiprinājuma dialogs "Sākt jaunu backupu"
+    const showConfirmDialog = useCallback((title, message, yesLabel, noLabel) => {
+        return new Promise(resolve => {
+            const overlay = document.createElement('div');
+            overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.8);display:flex;justify-content:center;align-items:center;z-index:1000;padding:20px;';
+            const box = document.createElement('div');
+            box.style.cssText = 'background:#161b22;border:1px solid #30363d;border-radius:12px;padding:32px;max-width:480px;width:100%;box-sizing:border-box;';
+            const titleEl = document.createElement('h2');
+            titleEl.textContent = title;
+            titleEl.style.cssText = 'color:#79c0ff;margin-bottom:16px;font-size:20px;';
+            const messageEl = document.createElement('p');
+            messageEl.textContent = message;
+            messageEl.style.cssText = 'color:#b0b8c4;margin-bottom:24px;line-height:1.5;font-size:14px;';
+            const yesButton = document.createElement('button');
+            yesButton.textContent = yesLabel;
+            yesButton.style.cssText = 'width:100%;padding:12px;background:#f85149;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer;margin-bottom:8px;font-weight:600;';
+            const noButton = document.createElement('button');
+            noButton.textContent = noLabel;
+            noButton.style.cssText = 'width:100%;padding:12px;background:#30363d;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer;';
+            box.appendChild(titleEl);
+            box.appendChild(messageEl);
+            box.appendChild(yesButton);
+            box.appendChild(noButton);
+            overlay.appendChild(box);
+            document.body.appendChild(overlay);
+
+            const cleanup = () => { overlay.remove(); };
+            yesButton.onclick = () => { cleanup(); resolve(true); };
+            noButton.onclick = () => { cleanup(); resolve(false); };
+            overlay.onclick = (e) => { if (e.target === overlay) { cleanup(); resolve(false); } };
+            document.addEventListener('keydown', function onEsc(e) {
+                if (e.key === 'Escape') {
+                    document.removeEventListener('keydown', onEsc);
+                    cleanup();
+                    resolve(false);
+                }
+            });
+            noButton.focus();
+        });
+    }, []);
+
     const promptMasterKey = useCallback(() => {
         return new Promise(resolve => {
             const overlay = document.createElement('div');
@@ -262,7 +303,13 @@ function BackupPage() {
             const input = document.createElement('input');
             input.type = 'password';
             input.placeholder = t('enter-key');
-            input.style.cssText = 'width:100%;padding:12px;background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#e6edf3;font-size:16px;margin-bottom:16px;box-sizing:border-box;';
+            // ✅ 2. LABOJUMS: Noņemts zilais rāmis
+            input.style.cssText = 'width:100%;padding:12px;background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#e6edf3;font-size:16px;margin-bottom:16px;box-sizing:border-box;outline:none;box-shadow:none;';
+            input.addEventListener('focus', () => {
+                input.style.borderColor = '#30363d';
+                input.style.boxShadow = 'none';
+                input.style.outline = 'none';
+            });
             const confirmButton = document.createElement('button');
             confirmButton.textContent = t('confirm-key');
             confirmButton.style.cssText = 'width:100%;padding:12px;background:#238636;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer;';
@@ -461,7 +508,6 @@ function BackupPage() {
                     if (redisRecovery?.success && redisRecovery.jobId) {
                         storedJobId = redisRecovery.jobId;
                         if (recoveryJournal?.jobId && recoveryJournal.jobId !== storedJobId) {
-                            // Do not mix local checkpoints belonging to a different job.
                             clearRecoveryJournal();
                             localStorage.removeItem(`permrepo-backup-tx-${repoStorageKey}`);
                             storedBackupTx = null;
@@ -770,9 +816,6 @@ function BackupPage() {
                                 return;
                             }
 
-                            // Redis has no record for this locally journaled ID.
-                            // Re-run preparation with the same ID; do not discard
-                            // the recovery pointer before the server recreates it.
                             recoveryJobIdForPrepare = storedJobId;
                             shouldStartNewBackup = true;
                         }
@@ -791,8 +834,6 @@ function BackupPage() {
                                 setFileInfo({ count: 0, sizeText: '', loading: false });
                                 return;
                             }
-                            // Keep the local journal as a fallback checkpoint and
-                            // recreate the Redis job using the same ID.
                             recoveryJobIdForPrepare = storedJobId;
                             shouldStartNewBackup = true;
                         } else {
@@ -934,7 +975,6 @@ function BackupPage() {
                         if (prevManifest && typeof prevManifest.paths === 'object' && !Array.isArray(prevManifest.paths)) {
                             previousPaths = Object.create(null);
                             for (const [filePath, info] of Object.entries(prevManifest.paths)) {
-                                // This is internal backup metadata, not a repository file.
                                 if (filePath !== '__permrepo_deletions__.json') {
                                     previousPaths[filePath] = info;
                                 }
@@ -1000,7 +1040,16 @@ function BackupPage() {
         readRecoveryJournal, updateRecoveryJournal, clearRecoveryJournal
     ]);
 
+    // ✅ 1. LABOJUMS: Pievienots apstiprinājums pirms jauna backupa sākšanas
     const startFreshBackup = useCallback(async () => {
+        const confirmed = await showConfirmDialog(
+            t('confirm-start-new-backup-title'),
+            t('confirm-start-new-backup-message'),
+            t('confirm-start-new-backup-yes'),
+            t('confirm-start-new-backup-no')
+        );
+        if (!confirmed) return;
+
         const recoveryJournal = readRecoveryJournal();
         const oldJobId = recoveredJobData?.jobId ||
             localStorage.getItem(`permrepo-job-${repoStorageKey}`) ||
@@ -1030,7 +1079,7 @@ function BackupPage() {
             setError(getSafeErrorMessage(error, t));
             setIsWorking(false);
         }
-    }, [apiJson, repoStorageKey, clearRecoveryJournal, readRecoveryJournal, recoveredJobData, preparedJobId, t]);
+    }, [apiJson, repoStorageKey, clearRecoveryJournal, readRecoveryJournal, recoveredJobData, preparedJobId, t, showConfirmDialog]);
 
     const continueBackup = useCallback(async () => {
         if (recoveredJobData?.freshStartRequired) {
@@ -1320,7 +1369,6 @@ function BackupPage() {
                     chunkingMode: 'auto'
                 });
 
-                // ✅ P1-5: Stingrāka Turbo atbildes pārbaude
                 if (!zipResult || typeof zipResult !== 'object') {
                     console.error('Turbo ZIP upload failed (no object):', zipResult);
                     throw new Error(t('turbo-upload-failed') + ': nav atbildes objekta');
@@ -1525,7 +1573,6 @@ function BackupPage() {
                     chunkingMode: 'auto'
                 });
 
-                // ✅ P1-5: Stingrāka Turbo atbildes pārbaude
                 if (!manifestResult || typeof manifestResult !== 'object') {
                     console.error('Turbo manifest upload failed (no object):', manifestResult);
                     throw new Error(t('turbo-upload-failed') + ': nav atbildes objekta');
@@ -1814,9 +1861,6 @@ function BackupPage() {
             setIsWorking(true);
             setError('');
 
-            // BC-08: the wallet may have broadcast addBackup but the browser
-            // closed before its returned hash reached localStorage/Redis.
-            // Search the recent chain history for the exact BackupAdded event.
             if (!txHash && recoveredJobData?.status === 'blockchain-finalizing') {
                 if (!window.ethereum || !config?.nftAddress) {
                     throw new Error(t('recovery-chain-search-unavailable'));
@@ -1868,9 +1912,6 @@ function BackupPage() {
                         body: JSON.stringify({ jobId: recoveredJobData.jobId || preparedJobId, txHash })
                     });
                 } else {
-                    // No matching mined event was found. Server independently
-                    // checks on-chain count/manifest before reopening the same
-                    // finalization so it can be signed and submitted again.
                     await apiJson('/api/reopen-blockchain-finalize', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
@@ -2066,13 +2107,11 @@ function BackupPage() {
                 </button>
             )}
 
-            {/* This action is intentionally always visible, including when an
-                unfinished backup can also be resumed. */}
+            {/* ✅ 4. LABOJUMS: "Sākt jaunu backupu" poga — oranžs gradients */}
             <button
                 onClick={startFreshBackup}
                 disabled={isWorking}
-                className="sign-button"
-                style={{ marginTop: '12px', background: 'linear-gradient(135deg, #555 0%, #333 100%)' }}
+                className="sign-button start-new-backup-btn"
             >
                 {t('start-new-backup')}
             </button>

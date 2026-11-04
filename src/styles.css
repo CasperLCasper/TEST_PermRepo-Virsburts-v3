@@ -380,3 +380,55 @@ a:hover { text-decoration: underline; }
     background: linear-gradient(135deg, #f0ad4e 0%, #d98b3a 100%) !important;
     box-shadow: 0 8px 20px rgba(240, 173, 78, 0.4) !important;
 }
+
+/* ================================================== */
+/* ✅ 1. LABOJUMS: Noņem zilo rāmi no visiem ievades laukiem */
+/* ================================================== */
+
+input:focus,
+input:focus-visible,
+textarea:focus,
+textarea:focus-visible,
+select:focus,
+select:focus-visible {
+    outline: none !important;
+    box-shadow: none !important;
+}
+
+input,
+textarea {
+    outline: none;
+}
+
+/* ================================================== */
+/* ✅ 4. LABOJUMS: "Sākt jaunu backupu" poga — izteiksmīgāka */
+/* ================================================== */
+
+button.start-new-backup-btn {
+    background: linear-gradient(135deg, #d97706 0%, #b45309 100%) !important;
+    border: 1px solid #f59e0b !important;
+    color: #fff !important;
+    font-weight: 700 !important;
+    box-shadow: 0 2px 8px rgba(217, 119, 6, 0.3) !important;
+}
+
+button.start-new-backup-btn:hover {
+    background: linear-gradient(135deg, #ea8a0c 0%, #c96310 100%) !important;
+    box-shadow: 0 8px 20px rgba(217, 119, 6, 0.45) !important;
+    transform: translateY(-1px);
+}
+
+/* ================================================== */
+/* ✅ 3. LABOJUMS: Divas pogas nepabeigtā backupa blokā */
+/* ================================================== */
+
+.unfinished-backup-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 16px;
+}
+
+.unfinished-backup-actions button {
+    margin-top: 0 !important;
+}

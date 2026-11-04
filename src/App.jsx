@@ -89,10 +89,10 @@ function App() {
             messageEl.style.cssText = 'color:#b0b8c4;margin-bottom:24px;line-height:1.5;font-size:14px;';
             const yesButton = document.createElement('button');
             yesButton.textContent = yesLabel;
-            yesButton.style.cssText = 'width:100%;padding:12px;background:#f85149;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer;margin-bottom:8px;font-weight:600;';
+            yesButton.style.cssText = 'width:100%;padding:12px;background:linear-gradient(135deg, #238636 0%, #2ea043 100%);color:#fff;border:1px solid #2ea043;border-radius:8px;font-size:16px;cursor:pointer;margin-bottom:8px;font-weight:600;box-shadow:0 2px 8px rgba(35, 134, 54, 0.3);';
             const noButton = document.createElement('button');
             noButton.textContent = noLabel;
-            noButton.style.cssText = 'width:100%;padding:12px;background:#30363d;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer;';
+            noButton.style.cssText = 'width:100%;padding:12px;background:linear-gradient(135deg, #da3633 0%, #f85149 100%);color:#fff;border:1px solid #f85149;border-radius:8px;font-size:16px;cursor:pointer;font-weight:600;';
             box.appendChild(titleEl);
             box.appendChild(messageEl);
             box.appendChild(yesButton);

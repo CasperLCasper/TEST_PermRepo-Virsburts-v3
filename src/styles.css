@@ -374,10 +374,12 @@ a:hover { text-decoration: underline; }
 /* ✅ Brīdinājuma poga */
 .sign-button-warning {
     background: linear-gradient(135deg, #f0ad4e 0%, #d98b3a 100%) !important;
+    background-size: 100% 100% !important;
 }
 
 .sign-button-warning:hover {
     background: linear-gradient(135deg, #f0ad4e 0%, #d98b3a 100%) !important;
+    background-size: 100% 100% !important;
     box-shadow: 0 8px 20px rgba(240, 173, 78, 0.4) !important;
 }
 
@@ -406,12 +408,12 @@ textarea {
 
 button.start-new-backup-btn {
     background: linear-gradient(135deg, #d97706 0%, #b45309 100%) !important;
+    background-size: 100% 100% !important;
     border: 1px solid #f59e0b !important;
     color: #fff !important;
     font-weight: 700 !important;
     box-shadow: 0 2px 8px rgba(217, 119, 6, 0.3) !important;
 
-    /* ✅ Izmēri */
     padding: 16px 24px !important;
     font-size: 16px !important;
     min-height: 42px !important;
@@ -420,6 +422,7 @@ button.start-new-backup-btn {
 
 button.start-new-backup-btn:hover {
     background: linear-gradient(135deg, #ea8a0c 0%, #c96310 100%) !important;
+    background-size: 100% 100% !important;
     box-shadow: 0 8px 20px rgba(217, 119, 6, 0.45) !important;
     transform: translateY(-1px);
 }

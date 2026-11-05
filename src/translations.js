@@ -113,6 +113,11 @@ export const translations = {
         'confirm-start-new-backup-yes': 'Jā, sākt jaunu',
         'confirm-start-new-backup-no': 'Nē, atcelt',
 
+        'confirm-return-to-home-title': 'Atgriezties uz sākumu?',
+        'confirm-return-to-home-message': 'Pašreizējais backupa process tiks pārtraukts. Vai tiešām vēlaties atgriezties uz sākumu?',
+        'confirm-return-to-home-yes': 'Jā, atgriezties',
+        'confirm-return-to-home-no': 'Nē, palikt',
+
         'mint-preparing': 'Sagatavo On-chain Deskriptora autorizāciju...',
         'mint-confirming': 'Apstiprina On-chain Deskriptora izveidi...',
         'mint-success': 'On-chain Deskriptors izveidots!',
@@ -235,6 +240,11 @@ export const translations = {
         'confirm-start-new-backup-yes': 'Yes, start new',
         'confirm-start-new-backup-no': 'No, cancel',
 
+        'confirm-return-to-home-title': 'Return to home?',
+        'confirm-return-to-home-message': 'The current backup process will be interrupted. Are you sure you want to return to home?',
+        'confirm-return-to-home-yes': 'Yes, return',
+        'confirm-return-to-home-no': 'No, stay',
+
         'mint-preparing': 'Preparing On-chain Descriptor authorization...',
         'mint-confirming': 'Confirming On-chain Descriptor creation...',
         'mint-success': 'On-chain Descriptor created!',
@@ -356,6 +366,11 @@ export const translations = {
         'confirm-start-new-backup-message': 'La nuna nefinita sekurkopio estos forlasita. Ĉu vi certe volas komenci kreadon de nova sekurkopio?',
         'confirm-start-new-backup-yes': 'Jes, komenci novan',
         'confirm-start-new-backup-no': 'Ne, nuligi',
+
+        'confirm-return-to-home-title': 'Ĉu reen al hejmo?',
+        'confirm-return-to-home-message': 'La nuna sekurkopia procezo estos interrompita. Ĉu vi certe volas reen al hejmo?',
+        'confirm-return-to-home-yes': 'Jes, reen',
+        'confirm-return-to-home-no': 'Ne, resti',
 
         'mint-preparing': 'Preparante la rajtigon por On-chain Deskriptoro...',
         'mint-confirming': 'Konfirmante la kreadon de On-chain Deskriptoro...',

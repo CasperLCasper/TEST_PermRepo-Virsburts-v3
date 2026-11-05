@@ -2069,13 +2069,17 @@ function BackupPage() {
                 )
             )}
 
-            <button
-                onClick={returnToHome}
-                disabled={isWorking}
-                className="sign-button"
-            >
-                {t('back-home')}
-            </button>
+           <button
+    onClick={returnToHome}
+    disabled={isWorking}
+    className="sign-button"
+    style={{
+        background: "url('/icons/poga1.svg') no-repeat center center",
+        backgroundSize: '100% 100%'
+    }}
+>
+    {t('back-home')}
+</button>
 
             {status && (
                 <div className="status-card" style={{ display: 'block' }}>

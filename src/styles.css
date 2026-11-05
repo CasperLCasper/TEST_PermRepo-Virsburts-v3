@@ -371,11 +371,10 @@ a:hover { text-decoration: underline; }
     }
 }
 
-/* ✅ Brīdinājuma poga — tagad ar poga.svg fonu */
+/* ✅ Brīdinājuma poga — ar poga.svg fonu, bez rāmja */
 .sign-button-warning {
     background: url('/icons/poga.svg') no-repeat center center !important;
     background-size: 100% 100% !important;
-    border: 1px solid #f0ad4e !important;
     box-shadow: 0 2px 8px rgba(240, 173, 78, 0.3) !important;
 }
 
@@ -405,13 +404,13 @@ textarea {
 }
 
 /* ================================================== */
-/* ✅ 4. LABOJUMS: "Sākt jaunu backupu" poga — tagad ar poga.svg fonu */
+/* ✅ 4. LABOJUMS: "Sākt jaunu backupu" poga — ar poga.svg fonu, bez rāmja */
 /* ================================================== */
 
 button.start-new-backup-btn {
     background: url('/icons/poga.svg') no-repeat center center !important;
     background-size: 100% 100% !important;
-    border: 1px solid #f59e0b !important;
+    border: none !important;
     color: #fff !important;
     font-weight: 700 !important;
     box-shadow: 0 2px 8px rgba(217, 119, 6, 0.3) !important;

@@ -1036,9 +1036,16 @@ function BackupPage() {
         readRecoveryJournal, updateRecoveryJournal, clearRecoveryJournal
     ]);
 
-    const returnToHome = useCallback(() => {
+    const returnToHome = useCallback(async () => {
+        const confirmed = await showConfirmDialog(
+            t('confirm-return-to-home-title'),
+            t('confirm-return-to-home-message'),
+            t('confirm-return-to-home-yes'),
+            t('confirm-return-to-home-no')
+        );
+        if (!confirmed) return;
         navigate('/');
-    }, [navigate]);
+    }, [navigate, showConfirmDialog, t]);
 
     const continueBackup = useCallback(async () => {
         if (recoveredJobData?.freshStartRequired) {
@@ -2037,7 +2044,7 @@ function BackupPage() {
                         onClick={recoverBackup}
                         disabled={isWorking}
                         className="sign-button"
-                        style={{ marginTop: '20px', background: 'linear-gradient(135deg, #f0ad4e 0%, #d98b3a 100%)' }}
+                        style={{ marginTop: '20px' }}
                     >
                         {isWorking ? <div className="spinner"></div> : t('recover-backup')}
                     </button>
@@ -2062,21 +2069,10 @@ function BackupPage() {
                 )
             )}
 
-            {backupCompleted && (
-                <button
-                    onClick={() => navigate('/')}
-                    className="sign-button"
-                    style={{ marginTop: '20px' }}
-                >
-                    {t('back-home')}
-                </button>
-            )}
-
             <button
                 onClick={returnToHome}
                 disabled={isWorking}
                 className="sign-button"
-                style={{ marginTop: '12px', background: 'linear-gradient(135deg, #555 0%, #333 100%)' }}
             >
                 {t('back-home')}
             </button>

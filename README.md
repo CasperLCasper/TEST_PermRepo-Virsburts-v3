@@ -22,7 +22,7 @@ Katrs repozitorijs iegūst **On-chain Deskriptoru** — unikālu ierakstu Base b
 - Saista tavu maku ar GitHub repozitoriju
 - Glabā backup metadatus (backupu skaits, pēdējais manifests, Merkle sakne)
 - Nodrošina permanentus, pārbaudāmus backupus
-- Ir **nepārdodams** (var tikai migrēt, nevis pārdot)
+- Bloķē parastu ERC-721 pārskaitīšanu un pārdošanu; īpašnieks var migrēt NFT uz citu maku. Tas neizslēdz ārpus ķēdes vienošanos par pārdošanu.
 
 ### Kāpēc PermRepo?
 
@@ -45,11 +45,13 @@ GitHub ir lielisks, bet tas **nav permanents**:
 
 1. Savieno GitHub (OAuth)
 2. Savieno maku (MetaMask uz Base)
-3. Iegādājies abonementu (2.5 USDC / mēnesī)
-4. Izvēlies repozitoriju
-5. Izveido On-chain Deskriptoru
+3. Izvēlies repozitoriju
+4. Izveido On-chain Deskriptoru (mintingam abonements nav nepieciešams)
+5. Aktivizē abonementu (2.5 USDC / mēnesī)
 6. Izveido backupu (ZIP + šifrē + augšupielādē uz Arweave)
 7. Pārbaudi (Merkle sakne uz Base)
+
+Abonements un aktīvs, makam piederošs On-chain Deskriptors ir nepieciešami backup veikšanai, nevis NFT mintingam.
 
 #### Backup plūsma
 
@@ -70,6 +72,24 @@ Reģistrē uz Base (addBackup)
        ↓
 ✅ Permanentais Backups
 ~~~
+
+
+### Standard Backup tvērums un ierobežojumi
+
+OAuth sesijas Redis glabājas ar AES-256-GCM šifrētu ierakstu; šifrēšanas atslēga tiek atvasināta no servera `SESSION_SECRET` un Redis saņem nevis atvērtu GitHub access token. Pašreizējais GitHub OAuth `repo` scope joprojām ir plašs un dod piekļuvi privāto repozitoriju saturam atbilstoši lietotāja tiesībām. GitHub App ar tikai lasīšanas `Contents` atļauju ir atsevišķs turpmāks uzdevums, jo tas prasa OAuth/autorizācijas arhitektūras maiņu.
+
+Pašreizējā Standard Backup versija saglabā **GitHub repozitorija noklusējuma zara failu momentuzņēmumu**. Tā nav pilna Git arhīva kopija un nesaglabā Git commit vēsturi, citus zarus, tagus, Issues, Pull Requests, Wiki, Releases vai Git LFS objektus. Pašreizējie noklusējuma ierobežojumi ir 5 000 faili vienā repozitorijā, 500 MiB kopējais failu apjoms, 100 MiB vienam failam un 600 MiB lejupielādētajam ZIP arhīvam (konfigurējami ar servera vides mainīgajiem).
+
+GitHub arhīvs serverī īslaicīgi tiek lejupielādēts un apstrādāts kā nešifrēts ZIP; faili tiek nosūtīti pārlūkam, kur tie tiek šifrēti ar lietotāja Master Key pirms augšupielādes uz Arweave. Tādēļ pašreizējo arhitektūru nedrīkst raksturot kā Zero-Knowledge: serveris apstrādes laikā redz repozitorija failu saturu. Master Key serverī netiek glabāta. Pazaudējot Master Key, datus nevar atšifrēt.
+
+Merkle sakne tiek reģistrēta Base blokķēdē un Restore klients to pārbauda pret manifesta un atjaunoto failu datiem; viedais līgums pats nelejupielādē un nepārbauda Arweave failu saturu.
+
+### Administratīvās uzticības un privātuma robežas
+
+- `restorePageURI` pašlaik var mainīt tikai NFT līguma owner; līgumā nav iebūvēta multisig vai timelock. Production līguma owner atslēgai jābūt aizsargātai ar multisig. Jaunās Restore lapas hash pirms URI maiņas jāpārbauda neatkarīgi.
+- `githubUserHash` ir deterministisks `keccak256` no publiska, skaitliski secīga GitHub lietotāja ID. Tas nav anonimizācijas risinājums — kandidāta ID var pārbaudīt pret on-chain hash. Esošo abonementu migrācijai uz citu identifikatoru vajadzīgs atsevišķs plāns.
+- NFT bloķē parastu ERC-721 pārskaitīšanu un pārdošanu, bet īpašnieks var izmantot `migrateNFT`, lai pārvietotu NFT uz citu maku. Tas neizslēdz ārpus ķēdes vienošanos par pārdošanu.
+- Mint signer ir servera hot key. Līguma owner var to nomainīt ar `setMintSigner`, un mint autorizācijas API ir ierobežots līdz 10 pieprasījumiem minūtē; jau izveidotus NFT šādi atsaukt nevar.
 
 ### Tehnoloģijas
 
@@ -151,7 +171,7 @@ node server.js
 ### Viedie kontrakti
 
 **PermRepoNFT**
-ERC-721 NFT (nepārdodams) ar EIP-712 mint autorizāciju, EIP-712 backup autorizāciju un On-chain Deskriptoru katram repozitorijam.
+ERC-721 NFT ar bloķētu parasto pārskaitīšanu, īpašnieka migrācijas funkciju, EIP-712 mint/backup autorizāciju un On-chain Deskriptoru katram repozitorijam.
 
 ~~~solidity
 function mintRepository(address recipient, string repository, uint256 deadline, bytes signature) external returns (uint256);
@@ -191,6 +211,7 @@ function isSubscribed(bytes32 githubHash) external view returns (bool);
 | Metode | Endpoints | Apraksts |
 |---|---|---|
 | POST | `/api/prepare-backup` | Sagatavo backupu (NDJSON straume) |
+| POST | `/api/delete-repository-jobs` | Avārijas režīmā dzēš visus izvēlētā repo Redis job, indeksus un bloķēšanas atslēgas |
 | GET | `/api/job-status` | Iegūst job statusu |
 | POST | `/api/start-zip-upload` | Sāk ZIP augšupielādi |
 | POST | `/api/save-zip-tx` | Saglabā ZIP transakciju |
@@ -253,7 +274,7 @@ Each repository gets an **On-chain Descriptor** — a unique record on the Base 
 - Links your wallet to a GitHub repository
 - Stores backup metadata (backup count, last manifest, Merkle root)
 - Enables permanent, verifiable backups
-- Is **non-transferable** (can only be migrated, not sold)
+- Is **not saleable through ordinary ERC-721 transfers** (the owner can explicitly migrate it to another wallet)
 
 ### Why PermRepo?
 
@@ -276,11 +297,13 @@ GitHub is great, but it's **not permanent**:
 
 1. Connect GitHub (OAuth)
 2. Connect Wallet (MetaMask on Base)
-3. Buy Subscription (2.5 USDC / month)
-4. Select Repository
-5. Create On-chain Descriptor
-6. Create Backup (ZIP + encrypt + upload to Arweave)
+3. Select Repository
+4. Create the On-chain Descriptor (minting does not require a subscription)
+5. Activate a subscription (2.5 USDC / month)
+6. Create a backup (ZIP + encrypt + upload to Arweave)
 7. Verify (Merkle root on Base)
+
+An active subscription and an active On-chain Descriptor owned by the connected wallet are required for backups, not for NFT minting.
 
 #### Backup Flow
 
@@ -301,6 +324,24 @@ Register on Base (addBackup)
        ↓
 ✅ Permanent Backup
 ~~~
+
+
+### Standard Backup scope and limits
+
+OAuth sessions are stored in Redis as AES-256-GCM encrypted records; the encryption key is derived from the server's `SESSION_SECRET`, so GitHub access tokens are not stored in plaintext. The current GitHub OAuth `repo` scope is still broad and grants access to private repository contents according to the user's permissions. Migrating to a GitHub App with read-only `Contents` permission remains a separate task because it requires an authorization architecture change.
+
+The current Standard Backup version stores a **file snapshot of the GitHub repository's default branch**. It is not a complete Git repository archive and does not preserve commit history, other branches, tags, Issues, Pull Requests, Wiki, Releases, or Git LFS objects. Current default limits are 5,000 files per repository, 500 MiB total file data, 100 MiB per file, and 600 MiB for the downloaded ZIP archive (configurable through server environment variables).
+
+The GitHub archive is temporarily downloaded and processed by the server as an unencrypted ZIP; files are sent to the browser, where they are encrypted with the user's Master Key before upload to Arweave. Therefore the current architecture must not be described as Zero-Knowledge: the server processes repository file contents in plaintext during preparation. The Master Key is not stored by the server. If the Master Key is lost, the data cannot be decrypted.
+
+The Merkle root is registered on Base and checked by the Restore client against the manifest and restored file data; the smart contract does not itself download or verify Arweave file contents.
+
+### Administrative trust and privacy boundaries
+
+- `restorePageURI` can currently be changed only by the NFT contract owner; the contract has no built-in multisig or timelock. The production contract owner key should be protected by a multisig. Independently verify the new Restore release hash before changing the URI.
+- `githubUserHash` is a deterministic `keccak256` of the public, sequential numeric GitHub user ID. It is not an anonymization mechanism: candidate IDs can be tested against the on-chain hash. Migrating existing subscriptions to a different identifier requires a separate migration plan.
+- The NFT blocks ordinary ERC-721 transfers and sales, but its owner can use `migrateNFT` to move it to another wallet. This cannot prevent an off-chain agreement to sell it.
+- The mint signer is a server hot key. The contract owner can rotate it with `setMintSigner`, and the mint authorization API is rate-limited to 10 requests per minute; already minted NFTs cannot be revoked this way.
 
 ### Tech Stack
 
@@ -382,7 +423,7 @@ node server.js
 ### Smart Contracts
 
 **PermRepoNFT**
-ERC-721 NFT (non-transferable) with EIP-712 mint authorization, EIP-712 backup authorization, and On-chain Descriptor per repository.
+ERC-721 NFT that blocks ordinary transfers and sales; the owner can explicitly migrate it to another wallet. It uses EIP-712 mint and backup authorizations and an On-chain Descriptor per repository.
 
 ~~~solidity
 function mintRepository(address recipient, string repository, uint256 deadline, bytes signature) external returns (uint256);
@@ -422,6 +463,7 @@ function isSubscribed(bytes32 githubHash) external view returns (bool);
 | Method | Endpoint | Description |
 |---|---|---|
 | POST | `/api/prepare-backup` | Prepare backup (NDJSON stream) |
+| POST | `/api/delete-repository-jobs` | Emergency-purges all Redis jobs, indexes, and lock keys for the selected repository |
 | GET | `/api/job-status` | Get job status |
 | POST | `/api/start-zip-upload` | Start ZIP upload |
 | POST | `/api/save-zip-tx` | Save ZIP transaction |

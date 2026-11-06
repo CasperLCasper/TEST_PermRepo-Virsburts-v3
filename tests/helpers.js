@@ -71,7 +71,7 @@ export const validManifest = (overrides = {}) => {
 };
 
 export function makeBackupValidator(source = backupSource) {
-  const fn = extractBetween(source, 'function validateManifest(manifest) {', '\nasync function verifyJobAuthorization');
+  const fn = extractBetween(source, 'function validateManifest(manifest) {', '\nfunction stableJson(value) {');
   return new Function(
     'validateArweaveId',
     'MAX_MANIFEST_BYTES',

@@ -28,7 +28,18 @@ import {
     resolveJobTtl,
     acquireJobLock,
     releaseJobLock,
-    extendJobLock
+    extendJobLock,
+    acquireRepositoryOperationLock,
+    extendRepositoryOperationLock,
+    releaseRepositoryOperationLock,
+    acquireRepositoryLock,
+    extendRepositoryLock,
+    releaseRepositoryLock,
+    deleteJobsForRepository,
+    requestRepositoryCancellation,
+    isRepositoryCancellationRequested,
+    clearRepositoryCancellation,
+    acquireEmergencyRepositoryOperationLock
 } from './accounting-redis.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -55,7 +66,9 @@ const TURBO_PAYMENT_URL = process.env.TURBO_PAYMENT_URL || '';
 const MINT_AUTHORIZATION_SIGNER_PRIVATE_KEY =
     process.env.MINT_AUTHORIZATION_SIGNER_PRIVATE_KEY || '';
 
-const REQUIRE_ANS104_LOCATION = process.env.REQUIRE_ANS104_LOCATION === 'true';
+const VERIFY_ANS104_SIGNATURES = (() => {
+    try { return BigInt(CHAIN_ID) === 8453n; } catch { return false; }
+})();
 
 const MAX_REPO_FILES = Number(process.env.MAX_REPO_FILES || 5000);
 const MAX_REPO_BYTES = Number(process.env.MAX_REPO_BYTES || 524288000);
@@ -669,10 +682,6 @@ async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchI
                     }
                 });
             } catch (error) {
-                if (!REQUIRE_ANS104_LOCATION) {
-                    console.warn(`⚠️ ANS-104 atrašanās vietas pārbaude izlaista (REQUIRE_ANS104_LOCATION=false). Iemesls: offsets (${offsetsError || 'nederīga atbilde'}) un HEAD /raw neizdevās (${error?.name === 'TimeoutError' ? 'taimauts' : 'tīkla kļūda'}).`);
-                    return false;
-                }
                 throw new Error(`Vārteja nenodrošināja ANS-104 atrašanās vietu: offsets (${offsetsError || 'nederīga atbilde'}) un HEAD /raw pieprasījums neizdevās (${error?.name === 'TimeoutError' ? 'taimauts' : 'tīkla kļūda'}).`);
             }
             if (headResponse.ok) {
@@ -688,10 +697,6 @@ async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchI
             try { await headResponse?.body?.cancel(); } catch {}
         }
         if (!location) {
-            if (!REQUIRE_ANS104_LOCATION) {
-                console.warn(`⚠️ ANS-104 atrašanās vietas pārbaude izlaista (REQUIRE_ANS104_LOCATION=false). Iemesls: offsets (${offsetsError || 'atrašanās vieta nav indeksēta'}) un HEAD /raw galvenes nav pietiekamas.`);
-                return false;
-            }
             throw new Error(`Vārteja nesniedza derīgu ANS-104 atrašanās vietu: offsets (${offsetsError || 'atrašanās vieta nav indeksēta'}) un HEAD /raw galvenes nav pietiekamas.`);
         }
     }
@@ -716,11 +721,14 @@ async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchI
         throw new Error('Iepriekšējā manifesta ANS-104 struktūra nav derīga.');
     }
     const item = new DataItem(rawItem);
-    if (!(await item.isValid())) {
+    if (item.id !== manifestId || !Buffer.from(item.rawData).equals(manifestBytes)) {
+        throw new Error('Iepriekšējā manifesta saturs neatbilst pieprasītajam Arweave datu vienuma ID.');
+    }
+    if (VERIFY_ANS104_SIGNATURES && !(await item.isValid())) {
         throw new Error('Iepriekšējā manifesta ANS-104 paraksts nav derīgs.');
     }
-    if (item.id !== manifestId || !Buffer.from(item.rawData).equals(manifestBytes)) {
-        throw new Error('Iepriekšējā manifesta saturs neatbilst parakstītajam Arweave datu vienumam.');
+    if (!VERIFY_ANS104_SIGNATURES) {
+        console.warn('⚠️ Devnet: ANS-104 paraksta kriptogrāfiskā pārbaude izlaista; struktūra, ID un datu atbilstība tika pārbaudīta.');
     }
     return true;
 }
@@ -762,10 +770,7 @@ async function loadPreviousManifest(lastManifest) {
             MAX_MANIFEST_BYTES,
             'Iepriekšējais manifests'
         );
-        const ans104Verified = await verifyArweaveDataItem(response, manifestBytes, prevManifestId, fetch, AR_IO_GATEWAY);
-        if (ans104Verified === false) {
-            console.warn('⚠️ ANS-104 datu vienuma verifikācija izlaista — turpinām ar manifesta strukturālo validāciju un Merkle root pārbaudi.');
-        }
+        await verifyArweaveDataItem(response, manifestBytes, prevManifestId, fetch, AR_IO_GATEWAY);
 
         let manifest;
         try {
@@ -849,46 +854,92 @@ function throwIfLockLost(signal) {
 }
 
 async function withJobLock(jobId, fn) {
-    const token = await acquireJobLock(jobId);
+    // Acquire the repository operation gate before the per-job lock. This
+    // serializes every mutating job route with emergency repository purges.
+    const initialJob = await getJob(jobId);
+    if (!initialJob) throw new Error('Backup job nav atrasts.');
 
-    if (!token) {
-        throw new Error('Job jau tiek apstrādāts.');
+    const repositoryId = String(
+        initialJob.githubRepositoryId ?? initialJob.repositoryId ?? initialJob.repoId ?? ''
+    );
+    if (!/^\d+$/.test(repositoryId)) {
+        throw new Error('Backup job nesatur derīgu GitHub repo ID.');
     }
 
+    const repositoryOperationLockToken = await acquireRepositoryOperationLock(repositoryId);
+    if (!repositoryOperationLockToken) {
+        throw new Error('Šim repozitorijam pašlaik notiek cita darbība vai avārijas dzēšana.');
+    }
+
+    let token = null;
+    let heartbeat = null;
+    let heartbeatActive = false;
+    let heartbeatBusy = false;
     const lockLostController = new AbortController();
-    let heartbeatActive = true;
 
-    const heartbeat = setInterval(async () => {
-        if (!heartbeatActive) return;
+    try {
+        const currentJob = await getJob(jobId);
+        if (!currentJob) throw new Error('Backup job tika dzēsts pirms darbības sākuma.');
+        const currentRepositoryId = String(
+            currentJob.githubRepositoryId ?? currentJob.repositoryId ?? currentJob.repoId ?? ''
+        );
+        if (currentRepositoryId !== repositoryId) {
+            throw new Error('Backup job repozitorija identitāte ir mainījusies.');
+        }
 
-        try {
-            const extended = await extendJobLock(jobId, token);
-            if (!extended) {
-                console.warn(`⚠️ Lock ${jobId} vairs nepieder mums — heartbeat apturēts, darbs tiek pārtraukts`);
+        token = await acquireJobLock(jobId);
+        if (!token) throw new Error('Job jau tiek apstrādāts.');
+
+        heartbeatActive = true;
+        heartbeat = setInterval(async () => {
+            if (!heartbeatActive || heartbeatBusy) return;
+            heartbeatBusy = true;
+            try {
+                const [jobExtended, repositoryExtended, cancellationRequested] = await Promise.all([
+                    extendJobLock(jobId, token),
+                    extendRepositoryOperationLock(repositoryId, repositoryOperationLockToken),
+                    isRepositoryCancellationRequested(repositoryId)
+                ]);
+                if (!jobExtended || !repositoryExtended || cancellationRequested) {
+                    heartbeatActive = false;
+                    clearInterval(heartbeat);
+                    lockLostController.abort(
+                        new Error(cancellationRequested ? 'Lietotājs pārtrauca šī repozitorija backup procesu.' : 'Job vai repozitorija slēdzene tika zaudēta — darbs pārtraukts.')
+                    );
+                }
+            } catch (error) {
                 heartbeatActive = false;
                 clearInterval(heartbeat);
                 lockLostController.abort(
-                    new Error('Job slēdzene tika zaudēta — darbs pārtraukts.')
+                    new Error(`Slēdzeņu heartbeat kļūda — darbs drošības dēļ apturēts: ${error?.message || error}`)
                 );
+            } finally {
+                heartbeatBusy = false;
             }
-        } catch (error) {
-            console.error('Lock heartbeat kļūda:', error);
-        }
-    }, LOCK_HEARTBEAT_MS);
+        }, LOCK_HEARTBEAT_MS);
+        heartbeat.unref();
 
-    heartbeat.unref();
-
-    try {
-        return await fn({
+        const result = await fn({
             lockSignal: lockLostController.signal,
             lockToken: token
         });
+        throwIfLockLost(lockLostController.signal);
+        return result;
     } finally {
         heartbeatActive = false;
-        clearInterval(heartbeat);
-        await releaseJobLock(jobId, token);
+        if (heartbeat) clearInterval(heartbeat);
+        if (token) {
+            await releaseJobLock(jobId, token)
+                .catch(error => console.error(`Job lock ${jobId} atbrīvošana neizdevās:`, error));
+        }
+        await releaseRepositoryOperationLock(repositoryId, repositoryOperationLockToken)
+            .catch(error => console.error(`Repo lock ${repositoryId} atbrīvošana neizdevās:`, error));
     }
 }
+
+// Encrypt session records before storing them in Redis. GitHub OAuth access
+// tokens are sensitive credentials; Redis should never contain them as plaintext.
+const { encryptSessionRecord, decryptSessionRecord } = createSessionRecordCodec(SESSION_SECRET);
 
 class UpstashSessionStore extends session.Store {
     constructor(redisClient, ttlSeconds) {
@@ -901,10 +952,17 @@ class UpstashSessionStore extends session.Store {
 
     get(sid, callback) {
         this.redis.get(this.key(sid))
-            .then(value => {
+            .then(async value => {
                 if (!value) return callback(null, null);
-                if (typeof value === 'object') return callback(null, value);
-                return callback(null, JSON.parse(String(value)));
+                const decoded = decryptSessionRecord(value);
+                if (decoded.legacyPlaintext) {
+                    await this.redis.set(
+                        this.key(sid),
+                        encryptSessionRecord(decoded.sessionData),
+                        { ex: this.ttlSeconds }
+                    );
+                }
+                return callback(null, decoded.sessionData);
             })
             .catch(error => callback(error));
     }
@@ -912,7 +970,7 @@ class UpstashSessionStore extends session.Store {
     set(sid, sess, callback = () => {}) {
         this.redis.set(
             this.key(sid),
-            JSON.stringify(sess),
+            encryptSessionRecord(sess),
             { ex: this.ttlSeconds }
         )
             .then(() => callback(null))
@@ -1135,7 +1193,7 @@ async function getGitHubRepository(githubToken, owner, repo) {
     };
 }
 
-async function getGitHubRepositoryById(githubToken, repositoryId) {
+async function getGitHubRepositoryById(githubToken, repositoryId, options = {}) {
     const id = Number(repositoryId);
     if (!Number.isSafeInteger(id) || id <= 0) {
         throw new Error('Nederīgs GitHub repo ID.');
@@ -1158,7 +1216,7 @@ async function getGitHubRepositoryById(githubToken, repositoryId) {
             ? 'GitHub repozitorijs nav atrasts vai kontam nav piekļuves.'
             : 'Neizdevās iegūt GitHub repozitorija datus.');
     }
-    if (data.archived) throw new Error('Arhivēts GitHub repozitorijs nav pieejams backupam.');
+    if (data.archived && options.allowArchived !== true) throw new Error('Arhivēts GitHub repozitorijs nav pieejams backupam.');
     if (!Number.isSafeInteger(data.id) || data.id !== id) throw new Error('GitHub repo ID nesakrīt ar pieprasīto.');
     if (!data.owner || !Number.isSafeInteger(data.owner.id) || !data.full_name || !data.default_branch) {
         throw new Error('GitHub repozitorija dati nav pilnīgi.');
@@ -1281,13 +1339,15 @@ async function downloadGitHubZipToTempFile(response, tempPath) {
     await pipeline(
         Readable.fromWeb(response.body),
         byteLimitTransform,
-        fs.createWriteStream(tempPath, { flags: 'wx' })
+        fs.createWriteStream(tempPath, { flags: 'wx', mode: 0o600 })
     );
 
     if (receivedBytes === 0) {
         throw new Error('GitHub ZIP atbilde ir tukša.');
     }
 
+    // Enforce restrictive permissions even if the process umask is permissive.
+    await fs.promises.chmod(tempPath, 0o600);
     return receivedBytes;
 }
 
@@ -1333,12 +1393,12 @@ async function openRepoArchive(githubToken, owner, repo, metadata) {
         }
     });
 
-    const tempPath = path.join(
-        os.tmpdir(),
-        `permrepo-${crypto.randomUUID()}.zip`
-    );
+    // Each plaintext GitHub archive lives in its own private directory.
+    const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'permrepo-'));
+    const tempPath = path.join(tempDir, 'repository.zip');
 
     try {
+        await fs.promises.chmod(tempDir, 0o700);
         await downloadGitHubZipToTempFile(response, tempPath);
 
         const zipfile = await yauzl.openPromise(tempPath, {
@@ -1349,10 +1409,10 @@ async function openRepoArchive(githubToken, owner, repo, metadata) {
 
         return {
             repository, commitSha, treeSha, blobs,
-            tempPath, zipfile
+            tempDir, tempPath, zipfile
         };
     } catch (error) {
-        await fs.promises.unlink(tempPath).catch(() => {});
+        await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
         throw error;
     }
 }
@@ -1656,6 +1716,31 @@ function validateManifest(manifest) {
         }
     }
 
+    if (manifest.history !== undefined) {
+        if (!Array.isArray(manifest.history)) {
+            throw new Error('Manifesta history nav masīvs. Backup ir apturēts, lai nepazaudētu iepriekšējo backup vēsturi.');
+        }
+        const historyIds = new Set();
+        for (const entry of manifest.history) {
+            if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
+                !validateArweaveId(entry.manifestId)) {
+                throw new Error('Manifesta history satur nederīgu ierakstu. Backup ir apturēts.');
+            }
+            if (historyIds.has(entry.manifestId)) {
+                throw new Error('Manifesta history satur dublētu manifest ID. Backup ir apturēts.');
+            }
+            historyIds.add(entry.manifestId);
+            if (entry.backupNumber !== undefined &&
+                (!Number.isSafeInteger(Number(entry.backupNumber)) || Number(entry.backupNumber) < 1)) {
+                throw new Error('Manifesta history satur nederīgu backupNumber. Backup ir apturēts.');
+            }
+            if (entry.merkleRoot !== undefined && entry.merkleRoot !== null &&
+                (typeof entry.merkleRoot !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(entry.merkleRoot))) {
+                throw new Error('Manifesta history satur nederīgu Merkle sakni. Backup ir apturēts.');
+            }
+        }
+    }
+
     if (manifest.deletedFiles !== undefined) {
         if (!Array.isArray(manifest.deletedFiles)) {
             throw new Error('Manifesta deletedFiles nav masīvs.');
@@ -1673,6 +1758,56 @@ function validateManifest(manifest) {
         }
     }
 
+    return true;
+}
+
+function stableJson(value) {
+    if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+    if (value && typeof value === 'object') {
+        return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+    }
+    return JSON.stringify(value);
+}
+
+async function validateManifestHistoryContinuity(manifest, job) {
+    const manifestHistory = Array.isArray(manifest.history) ? manifest.history : [];
+    let previousHistory = job.previousManifestHistory;
+
+    // Older in-flight jobs predate the stored history snapshot. Re-fetch their
+    // previous manifest rather than silently assuming an empty history.
+    if (!Array.isArray(previousHistory) && job.lastManifest) {
+        const previousManifest = await loadPreviousManifest(job.lastManifest);
+        previousHistory = Array.isArray(previousManifest?.history) ? previousManifest.history : [];
+    }
+    if (!Array.isArray(previousHistory)) previousHistory = [];
+
+    const expectedIds = new Set();
+    for (const previousEntry of previousHistory) {
+        if (!previousEntry || typeof previousEntry !== 'object' || !validateArweaveId(previousEntry.manifestId) || expectedIds.has(previousEntry.manifestId)) {
+            throw new Error('Iepriekšējā manifesta history nav derīga vai satur dublētus ID.');
+        }
+        expectedIds.add(previousEntry.manifestId);
+        const preservedEntry = manifestHistory.find(entry => entry?.manifestId === previousEntry.manifestId);
+        if (!preservedEntry || stableJson(preservedEntry) !== stableJson(previousEntry)) {
+            throw new Error(`Jaunajā manifestā nav saglabāts iepriekšējais history ieraksts ${previousEntry.manifestId}. Backup vēsture netika saglabāta.`);
+        }
+    }
+
+    if (job.lastManifest) {
+        if (typeof job.lastManifest !== 'string' || !job.lastManifest.startsWith('ar://')) {
+            throw new Error('Job iepriekšējā manifesta URI nav derīgs; vēstures nepārtrauktību nevar pārbaudīt.');
+        }
+        const previousManifestId = job.lastManifest.slice(5);
+        if (!validateArweaveId(previousManifestId)) {
+            throw new Error('Iepriekšējā manifesta ID nav derīgs.');
+        }
+        expectedIds.add(previousManifestId);
+    }
+
+    if (manifestHistory.length !== expectedIds.size ||
+        manifestHistory.some(entry => !expectedIds.has(entry.manifestId))) {
+        throw new Error('Jaunā manifesta history satur trūkstošus vai nepamatotus ierakstus. Backup vēsture netika saglabāta.');
+    }
     return true;
 }
 
@@ -2138,6 +2273,12 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
     let streamStarted = false;
     let queueHeartbeat = null;
     let clientClosed = false;
+    let repositoryOperationLockToken = null;
+    let repositoryLockToken = null;
+    let repositoryLockHeartbeat = null;
+    let repositoryLockHeartbeatActive = false;
+    let repositoryLockHeartbeatBusy = false;
+    let repositoryLockLost = false;
 
     const onResponseClose = () => {
         clientClosed = true;
@@ -2170,6 +2311,56 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
                 error: 'Nederīga maka adrese.'
             });
         }
+        if (await isRepositoryCancellationRequested(id)) {
+            return res.status(409).json({ success: false, error: 'Šim repozitorijam tiek pārtraukts iepriekšējais backup process. Mēģini vēlreiz pēc dzēšanas.' });
+        }
+
+        // Serialize all operations for this repository so an emergency purge
+        // cannot race with a new job being written. Keep the wallet-scoped lock
+        // as the additional owner identity lock requested for backup creation.
+        repositoryOperationLockToken = await acquireRepositoryOperationLock(id);
+        if (!repositoryOperationLockToken) {
+            return res.status(409).json({
+                success: false,
+                error: 'Šim repozitorijam jau notiek backup vai avārijas dzēšana. Mēģini vēlāk.'
+            });
+        }
+
+        repositoryLockToken = await acquireRepositoryLock(githubUserId, id, normalizedWallet);
+        if (!repositoryLockToken) {
+            return res.status(409).json({
+                success: false,
+                error: 'Šim GitHub lietotāja, repozitorija un maka pārim jau notiek backup.'
+            });
+        }
+
+        repositoryLockHeartbeatActive = true;
+        repositoryLockHeartbeat = setInterval(async () => {
+            if (!repositoryLockHeartbeatActive || repositoryLockHeartbeatBusy) return;
+            repositoryLockHeartbeatBusy = true;
+            try {
+                const [operationExtended, walletExtended, cancellationRequested] = await Promise.all([
+                    extendRepositoryOperationLock(id, repositoryOperationLockToken),
+                    extendRepositoryLock(githubUserId, id, normalizedWallet, repositoryLockToken),
+                    isRepositoryCancellationRequested(id)
+                ]);
+                if (!operationExtended || !walletExtended || cancellationRequested) {
+                    repositoryLockLost = true;
+                    if (cancellationRequested && !resourceLease && resourceQueueId) backupResourceController.cancel(resourceQueueId);
+                    repositoryLockHeartbeatActive = false;
+                    clearInterval(repositoryLockHeartbeat);
+                    console.error(`Repo ${id} bloķēšana zaudēta vai saņemts atcelšanas pieprasījums; backup sagatavošana tiks apturēta.`);
+                }
+            } catch (lockError) {
+                repositoryLockLost = true;
+                repositoryLockHeartbeatActive = false;
+                clearInterval(repositoryLockHeartbeat);
+                console.error('Repo lock heartbeat kļūda:', lockError);
+            } finally {
+                repositoryLockHeartbeatBusy = false;
+            }
+        }, LOCK_HEARTBEAT_MS);
+        repositoryLockHeartbeat.unref();
 
         const repoData = await getGitHubRepositoryById(githubToken, id);
         if (!repoData.permissions || (!repoData.permissions.admin && !repoData.permissions.push)) {
@@ -2215,7 +2406,7 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
 
         const archiveMetadata = await getRepoArchiveMetadata(
             githubToken, repoData.ownerLogin, repoName,
-            req.body.defaultBranch || repoData.defaultBranch
+            repoData.defaultBranch
         );
 
         let maxFileBytes = 0;
@@ -2336,6 +2527,9 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
         }
 
         resourceLease = await acquireResult.promise;
+        if (repositoryLockLost || await isRepositoryCancellationRequested(id)) {
+            throw new Error('Lietotājs pārtrauca šī repozitorija backup procesu.');
+        }
 
         if (queueHeartbeat) {
             clearInterval(queueHeartbeat);
@@ -2380,6 +2574,9 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
         });
 
         await processRepoArchive(archive, async file => {
+            if (repositoryLockLost || await isRepositoryCancellationRequested(id)) {
+                throw new Error('Lietotājs pārtrauca šī repozitorija backup procesu.');
+            }
             if (file.path === '__permrepo_deletions__.json') {
                 throw new Error('Faila ceļš __permrepo_deletions__.json ir rezervēts PermRepo dzēšanas marķierim.');
             }
@@ -2439,6 +2636,7 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
             onChainBackupCount: backupCount.toString(),
             lastManifest: lastManifest || null,
             lastMerkleRoot: lastMerkleRoot || null,
+            previousManifestHistory: Array.isArray(previousManifest?.history) ? previousManifest.history : [],
             changedFileMetadata,
             unchangedFiles,
             deletedFiles,
@@ -2460,7 +2658,15 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
             updatedAt: now
         };
 
-        await createJob(jobId, job, resolveJobTtl(job));
+        if (repositoryLockLost || clientClosed || await isRepositoryCancellationRequested(id)) {
+            throw new Error('Repozitorija bloķēšana vai klienta savienojums tika zaudēts; backup job netika izveidots.');
+        }
+        await createJob(jobId, job, resolveJobTtl(job), {
+            repositoryOperationLockToken,
+            repositoryLockToken,
+            githubUserId,
+            walletAddress: normalizedWallet
+        });
 
         await writeNdjson(res, {
             type: 'complete',
@@ -2523,6 +2729,12 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
             queueHeartbeat = null;
         }
 
+        repositoryLockHeartbeatActive = false;
+        if (repositoryLockHeartbeat) {
+            clearInterval(repositoryLockHeartbeat);
+            repositoryLockHeartbeat = null;
+        }
+
         if (!resourceLease && resourceQueueId) {
             backupResourceController.cancel(resourceQueueId);
         }
@@ -2531,13 +2743,28 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
             try { archive.zipfile.close(); } catch {}
         }
 
-        if (archive?.tempPath) {
+        if (archive?.tempDir) {
+            await fs.promises.rm(archive.tempDir, { recursive: true, force: true }).catch(() => {});
+        } else if (archive?.tempPath) {
             await fs.promises.unlink(archive.tempPath).catch(() => {});
         }
 
         if (resourceLease) {
             resourceLease.release();
             resourceLease = null;
+        }
+
+        if (repositoryLockToken) {
+            await releaseRepositoryLock(
+                String(req.session?.githubUserId || ''),
+                String(req.body?.repositoryId || ''),
+                String(req.body?.walletAddress || '').toLowerCase(),
+                repositoryLockToken
+            ).catch(error => console.error('Repo wallet lock atbrīvošana neizdevās:', error));
+        }
+        if (repositoryOperationLockToken) {
+            await releaseRepositoryOperationLock(String(req.body?.repositoryId || ''))
+                .catch(error => console.error('Repo operation lock atbrīvošana neizdevās:', error));
         }
 
         res.off('close', onResponseClose);
@@ -2989,6 +3216,9 @@ app.post('/api/save-manifest-tx', backupLimiter, async (req, res) => {
                 ...job,
                 walletAddress: wallet
             });
+            throwIfLockLost(lockSignal);
+
+            await validateManifestHistoryContinuity(manifest, job);
             throwIfLockLost(lockSignal);
 
             const manifestRepositoryId = String(manifest.metadata.repositoryId);
@@ -3612,7 +3842,101 @@ app.post('/api/complete-backup', backupLimiter, async (req, res) => {
 });
 
 // =============================================================================
-// Delete job — reset poga, kas dzēš job no Redis
+// Emergency purge — delete every Redis job belonging to the selected repo.
+// Published Arweave data and already-submitted blockchain transactions cannot
+// be recalled by deleting Redis state.
+// =============================================================================
+
+app.post('/api/delete-repository-jobs', backupLimiter, async (req, res) => {
+    let operationLockToken = null;
+    let operationLockHeartbeat = null;
+    let operationLockHeartbeatActive = false;
+    let operationLockHeartbeatBusy = false;
+    const repositoryId = String(req.body?.repositoryId || '');
+    try {
+        assertSameOrigin(req);
+        if (!requireGithubSession(req, res)) return;
+        const numericRepositoryId = Number(repositoryId);
+        if (!/^\d+$/.test(repositoryId) || !Number.isSafeInteger(numericRepositoryId) || numericRepositoryId <= 0) {
+            return res.status(400).json({ success: false, error: 'Nederīgs GitHub repo ID.' });
+        }
+
+        const repoData = await getGitHubRepositoryById(req.session.githubToken, numericRepositoryId, { allowArchived: true });
+        if (!repoData.permissions?.admin) {
+            return res.status(403).json({
+                success: false,
+                error: 'Avārijas dzēšanu drīkst veikt tikai GitHub repozitorija administrators.'
+            });
+        }
+
+        // First fence the repository: new backup/job operations are rejected,
+        // and existing workers stop on their next heartbeat/checkpoint.
+        await requestRepositoryCancellation(repositoryId, 900);
+        const stopDeadline = Date.now() + 90000;
+        while (!operationLockToken && Date.now() < stopDeadline) {
+            operationLockToken = await acquireEmergencyRepositoryOperationLock(repositoryId);
+            if (!operationLockToken) await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+        if (!operationLockToken) {
+            return res.status(409).json({
+                success: false,
+                cancellationPending: true,
+                error: 'Repozitorija backup process vēl nav apstājies. Jaunu backup nevar sākt; mēģini šo darbību atkārtoti pēc procesa apturēšanas.'
+            });
+        }
+
+        operationLockHeartbeatActive = true;
+        operationLockHeartbeat = setInterval(async () => {
+            if (!operationLockHeartbeatActive || operationLockHeartbeatBusy) return;
+            operationLockHeartbeatBusy = true;
+            try {
+                const extended = await extendRepositoryOperationLock(repositoryId, operationLockToken);
+                if (!extended) {
+                    operationLockHeartbeatActive = false;
+                    clearInterval(operationLockHeartbeat);
+                    console.error(`Repo ${repositoryId} emergency purge lock tika zaudēts.`);
+                }
+            } catch (heartbeatError) {
+                // Keep retrying; the purge function independently verifies the token
+                // before each batch and will fail closed if the lease is lost.
+                console.error('Emergency purge lock heartbeat kļūda:', heartbeatError);
+            } finally {
+                operationLockHeartbeatBusy = false;
+            }
+        }, LOCK_HEARTBEAT_MS);
+        operationLockHeartbeat.unref();
+
+        const result = await deleteJobsForRepository(repositoryId, operationLockToken);
+        if (result.remainingCount !== 0 || result.remainingIndexCount !== 0 || result.remainingLockCount !== 0) {
+            return res.status(500).json({
+                success: false,
+                error: 'Avārijas dzēšana nav pabeigta: Redis vēl ir saistīti job, indeksi vai bloķēšanas atslēgas.',
+                ...result
+            });
+        }
+
+        await clearRepositoryCancellation(repositoryId);
+        return res.json({
+            success: true,
+            repositoryId,
+            repository: repoData.fullName,
+            ...result
+        });
+    } catch (error) {
+        console.error('Repository emergency purge failed:', error);
+        return res.status(500).json({ success: false, error: errorMessage(error) });
+    } finally {
+        operationLockHeartbeatActive = false;
+        if (operationLockHeartbeat) clearInterval(operationLockHeartbeat);
+        if (operationLockToken) {
+            await releaseRepositoryOperationLock(repositoryId, operationLockToken)
+                .catch(error => console.error('Emergency purge lock release failed:', error));
+        }
+    }
+});
+
+// =============================================================================
+// Delete job — legacy single-job endpoint retained for compatibility
 // =============================================================================
 
 app.post('/api/delete-job', backupLimiter, async (req, res) => {
@@ -3799,7 +4123,7 @@ app.get('/api/health', async (req, res) => {
         turboUpload: Boolean(TURBO_UPLOAD_URL),
         turboPayment: Boolean(TURBO_PAYMENT_URL),
         mintAuthorization: Boolean(MINT_AUTHORIZATION_SIGNER_PRIVATE_KEY),
-        requireAns104Location: REQUIRE_ANS104_LOCATION
+        verifyAns104Signatures: VERIFY_ANS104_SIGNATURES
     });
 });
 
@@ -3825,7 +4149,7 @@ app.listen(PORT, () => {
     logInfo('Max backup queue', MAX_BACKUP_QUEUE);
     logInfo('Lock heartbeat', `${LOCK_HEARTBEAT_MS}ms`);
     logInfo('Job TTL', `${JOB_TTL_SECONDS}s (${JOB_TTL_SECONDS / 3600}h)`);
-    logInfo('Require ANS-104 location', REQUIRE_ANS104_LOCATION ? '✅ JĀ (mainnet)' : '⚠️ NĒ (devnet)');
+    logInfo('Verify ANS-104 signatures', VERIFY_ANS104_SIGNATURES ? '✅ JĀ (Base mainnet)' : '⚠️ NĒ (devnet; structural and ID/data checks remain enabled)');
     logInfo('Redis', '✅ IR');
     logInfo('RPC', RPC_URL);
     logInfo('NFT', NFT_ADDRESS || '❌ NAV');

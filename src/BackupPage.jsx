@@ -33,6 +33,32 @@ function isValidManifestId(id) {
     return typeof id === 'string' && /^[a-zA-Z0-9_-]{43}$/.test(id);
 }
 
+function validateManifestHistory(history) {
+    if (history === undefined) return [];
+    if (!Array.isArray(history)) {
+        throw new Error('Iepriekšējā manifesta history nav masīvs.');
+    }
+    const historyIds = new Set();
+    for (const entry of history) {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry) || !isValidManifestId(entry.manifestId)) {
+            throw new Error('Iepriekšējā manifesta history satur nederīgu ierakstu.');
+        }
+        if (historyIds.has(entry.manifestId)) {
+            throw new Error('Iepriekšējā manifesta history satur dublētu manifest ID.');
+        }
+        historyIds.add(entry.manifestId);
+        if (entry.backupNumber !== undefined &&
+            (!Number.isSafeInteger(Number(entry.backupNumber)) || Number(entry.backupNumber) < 1)) {
+            throw new Error('Iepriekšējā manifesta history satur nederīgu backupNumber.');
+        }
+        if (entry.merkleRoot !== undefined && entry.merkleRoot !== null &&
+            (typeof entry.merkleRoot !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(entry.merkleRoot))) {
+            throw new Error('Iepriekšējā manifesta history satur nederīgu Merkle sakni.');
+        }
+    }
+    return history;
+}
+
 function getValidatedManifestUrl(gatewayUrl, manifestId, t) {
     if (!isValidManifestId(manifestId)) {
         throw new Error(t('invalid-manifest-id'));
@@ -701,28 +727,36 @@ function BackupPage() {
                                 });
 
                                 previousManifestRef.current = null;
-                                if (jobStatus.lastManifest?.startsWith('ar://')) {
-                                    const prevManifestId = jobStatus.lastManifest.slice(5);
-                                    
-                                    if (isValidManifestId(prevManifestId)) {
-                                        setCurrentPreviousManifestId(prevManifestId);
-                                        
-                                        try {
-                                            const manifestUrl = getValidatedManifestUrl(
-                                                configData.arweaveGateway,
-                                                prevManifestId,
-                                                t
-                                            );
-                                            const manifestResponse = await fetch(manifestUrl, { cache: 'no-store' });
-                                            
-                                            if (manifestResponse.ok) {
-                                                const prevManifest = await manifestResponse.json();
-                                                previousManifestRef.current = prevManifest;
-                                                
-                                                if (Array.isArray(prevManifest?.history)) {
-                                                    setCurrentPreviousHistory(prevManifest.history);
+                                if (jobStatus.lastManifest) {
+                                    if (!jobStatus.lastManifest.startsWith('ar://')) {
+                                        if (!jobStatus.manifestTxId) {
+                                            throw new Error('Iepriekšējā manifesta adrese nav derīga; backup turpināts netiks.');
+                                        }
+                                    } else {
+                                        const prevManifestId = jobStatus.lastManifest.slice(5);
+                                        if (!isValidManifestId(prevManifestId)) {
+                                            if (!jobStatus.manifestTxId) {
+                                                throw new Error('Iepriekšējā manifesta ID nav derīgs; backup turpināts netiks.');
+                                            }
+                                        } else {
+                                            setCurrentPreviousManifestId(prevManifestId);
+
+                                            try {
+                                                const manifestUrl = getValidatedManifestUrl(
+                                                    configData.arweaveGateway,
+                                                    prevManifestId,
+                                                    t
+                                                );
+                                                const manifestResponse = await fetch(manifestUrl, { cache: 'no-store' });
+                                                if (!manifestResponse.ok) {
+                                                    throw new Error(`Iepriekšējā manifesta ielāde neizdevās (HTTP ${manifestResponse.status}).`);
                                                 }
-                                                
+
+                                                const prevManifest = await manifestResponse.json();
+                                                const validatedHistory = validateManifestHistory(prevManifest?.history);
+                                                previousManifestRef.current = prevManifest;
+                                                setCurrentPreviousHistory(validatedHistory);
+
                                                 if (
                                                     prevManifest?.encryption?.ivs &&
                                                     typeof prevManifest.encryption.ivs === 'object' &&
@@ -732,7 +766,7 @@ function BackupPage() {
                                                         Object.assign(Object.create(null), prevManifest.encryption.ivs)
                                                     );
                                                 }
-                                                
+
                                                 if (
                                                     prevManifest?.paths &&
                                                     typeof prevManifest.paths === 'object' &&
@@ -742,12 +776,20 @@ function BackupPage() {
                                                         Object.assign(Object.create(null), prevManifest.paths)
                                                     );
                                                 }
+                                            } catch (manifestError) {
+                                                console.warn('Neizdevās ielādēt iepriekšējo manifestu:', manifestError);
+                                                // If the manifest has not yet been uploaded, its history is needed
+                                                // to build the next manifest. Never replace it with an empty history.
+                                                if (!jobStatus.manifestTxId) {
+                                                    throw new Error(`Neizdevās ielādēt iepriekšējo manifestu; backup turpināts netiks, lai nepazaudētu vēsturi. ${manifestError.message || ''}`);
+                                                }
                                             }
-                                        } catch (manifestError) {
-                                            console.warn('Neizdevās ielādēt iepriekšējo manifestu:', manifestError);
                                         }
                                     }
+                                } else if (Number(jobStatus.backupCount || 0) > 0 && !jobStatus.manifestTxId) {
+                                    throw new Error('Iepriekšējā manifesta trūkst; backup turpināts netiks, lai nepazaudētu vēsturi.');
                                 }
+
 
                                 if (jobStatus.manifestTxId && !jobStatus.manifest) {
                                     try {
@@ -954,6 +996,9 @@ function BackupPage() {
                     let previousEncryptionIVs = Object.create(null);
 
                     previousManifestRef.current = null;
+                    if (!metadata.lastManifest && Number(metadata.backupCount || 0) > 0) {
+                        throw new Error(t('manifest-load-failed'));
+                    }
                     if (metadata.lastManifest && metadata.lastManifest.startsWith('ar://')) {
                         const prevManifestId = metadata.lastManifest.slice(5);
                         if (!isValidManifestId(prevManifestId)) {
@@ -967,6 +1012,7 @@ function BackupPage() {
                         if (!manifestResponse.ok) throw new Error(t('manifest-load-failed'));
 
                         const prevManifest = await manifestResponse.json();
+                        const validatedHistory = validateManifestHistory(prevManifest?.history);
                         previousManifestRef.current = prevManifest;
                         if (prevManifest && typeof prevManifest.paths === 'object' && !Array.isArray(prevManifest.paths)) {
                             previousPaths = Object.create(null);
@@ -977,10 +1023,8 @@ function BackupPage() {
                             }
                             setCurrentUnchangedFiles(previousPaths);
                         }
-                        if (Array.isArray(prevManifest?.history)) {
-                            previousHistory = prevManifest.history;
-                            setCurrentPreviousHistory(prevManifest.history);
-                        }
+                        previousHistory = validatedHistory;
+                        setCurrentPreviousHistory(validatedHistory);
                         if (prevManifest?.encryption?.ivs && typeof prevManifest.encryption.ivs === 'object' && !Array.isArray(prevManifest.encryption.ivs)) {
                             previousEncryptionIVs = Object.assign(Object.create(null), prevManifest.encryption.ivs);
                             setCurrentPreviousEncryptionIVs(previousEncryptionIVs);
@@ -2069,17 +2113,13 @@ function BackupPage() {
                 )
             )}
 
-           <button
-    onClick={returnToHome}
-    disabled={isWorking}
-    className="sign-button"
-    style={{
-        background: "url('/icons/poga1.svg') no-repeat center center",
-        backgroundSize: '100% 100%'
-    }}
->
-    {t('back-home')}
-</button>
+            <button
+                onClick={returnToHome}
+                disabled={isWorking}
+                className="sign-button"
+            >
+                {t('back-home')}
+            </button>
 
             {status && (
                 <div className="status-card" style={{ display: 'block' }}>

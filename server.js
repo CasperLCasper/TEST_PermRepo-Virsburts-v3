@@ -11,6 +11,7 @@ import { pipeline } from 'stream/promises';
 import { fileURLToPath } from 'url';
 import crypto from 'crypto';
 import session from 'express-session';
+import { createSessionRecordCodec } from './session-crypto.js';
 import rateLimit from 'express-rate-limit';
 import { ethers } from 'ethers';
 import yauzl from 'yauzl';

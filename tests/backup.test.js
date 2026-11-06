@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   backupSource, validManifest, ZIP_ID, OTHER_ZIP_ID,
-  makeBackupValidator, extractB06Guard, makePreviousManifestLoader,
+  makeBackupValidator, extractBetween, extractB06Guard, makePreviousManifestLoader,
   calculateArchiveMerkleRoot
 } from './helpers.js';
 
@@ -162,9 +162,10 @@ test('B05b — manifesta maksimālais izmērs tiek ievērots', () => {
     'Buffer',
     'calculateArchiveMerkleRoot',
     'ethers',
-    `return (${backupSource.slice(
-      backupSource.indexOf('function validateManifest(manifest) {'),
-      backupSource.indexOf('\nasync function verifyJobAuthorization')
+    `return (${extractBetween(
+      backupSource,
+      'function validateManifest(manifest) {',
+      '\nfunction stableJson(value) {'
     )});`
   )(
     id => typeof id === 'string' && /^[A-Za-z0-9_-]{43}$/.test(id),

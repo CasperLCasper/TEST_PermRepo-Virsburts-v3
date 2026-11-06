@@ -16,6 +16,7 @@ export const translations = {
         'subscription-active': 'Abonements: AKTĪVS',
         'subscription-expired': 'Abonements: BEIDZIES — ATJAUNOT',
         'subscription-required': 'Nepieciešams aktīvs abonements',
+        'mint-no-subscription-needed': 'NFT mintingam abonements nav nepieciešams. Aktīvs abonements vajadzīgs tikai backup veikšanai.',
         'days': 'dienas',
         'wallet-connected': 'Maks savienots',
         'wallet-changed': 'Maks tika nomainīts — lūdzu, savienojiet vēlreiz',
@@ -109,7 +110,7 @@ export const translations = {
         'start-new-backup': 'Sākt jauna backup`a izveidi',
 
         'confirm-start-new-backup-title': 'Sākt jauna backup`a izveidi?',
-        'confirm-start-new-backup-message': 'Pašreizējais nepabeigtais backups tiks pamests. Vai tiešām vēlaties sākt jauna backup`a izveidi?',
+        'confirm-start-new-backup-message': 'Tiks pārtraukti šī GitHub repozitorija aktīvie backup procesi un dzēsti VISI tā backup darba ieraksti Redis neatkarīgi no statusa, vecuma vai maka. Arweave publicētie dati un jau iesniegtās blokķēdes transakcijas netiks dzēstas. Vai tiešām turpināt?',
         'confirm-start-new-backup-yes': 'Jā, sākt jaunu',
         'confirm-start-new-backup-no': 'Nē, atcelt',
 
@@ -143,6 +144,7 @@ export const translations = {
         'subscription-active': 'Subscription: ACTIVE',
         'subscription-expired': 'Subscription: EXPIRED — RENEW',
         'subscription-required': 'Active subscription required',
+        'mint-no-subscription-needed': 'NFT minting does not require a subscription. An active subscription is required only to create backups.',
         'days': 'days',
         'wallet-connected': 'Wallet connected',
         'wallet-changed': 'Wallet was changed — please reconnect',
@@ -236,7 +238,7 @@ export const translations = {
         'start-new-backup': 'Start creating a new backup',
 
         'confirm-start-new-backup-title': 'Start creating a new backup?',
-        'confirm-start-new-backup-message': 'The current unfinished backup will be abandoned. Are you sure you want to start creating a new backup?',
+        'confirm-start-new-backup-message': 'Active backup processes for this GitHub repository will be stopped, and ALL its backup job records will be deleted from Redis, regardless of status, age, or wallet. Data already published to Arweave and blockchain transactions already submitted will NOT be deleted. Continue?',
         'confirm-start-new-backup-yes': 'Yes, start new',
         'confirm-start-new-backup-no': 'No, cancel',
 
@@ -270,6 +272,7 @@ export const translations = {
         'subscription-active': 'Abono: AKTIVA',
         'subscription-expired': 'Abono: EKSPIRIS – RENOVIGI',
         'subscription-required': 'Aktiva abono estas bezonata',
+        'mint-no-subscription-needed': 'NFT-kreado ne bezonas abonon. Aktiva abono necesas nur por krei sekurkopiojn.',
         'days': 'tagoj',
         'wallet-connected': 'Monujo konektita',
         'wallet-changed': 'Monujo estis ŝanĝita — bonvolu rekonekti',
@@ -363,7 +366,7 @@ export const translations = {
         'start-new-backup': 'Komenci kreadon de nova sekurkopio',
 
         'confirm-start-new-backup-title': 'Ĉu komenci kreadon de nova sekurkopio?',
-        'confirm-start-new-backup-message': 'La nuna nefinita sekurkopio estos forlasita. Ĉu vi certe volas komenci kreadon de nova sekurkopio?',
+        'confirm-start-new-backup-message': 'Aktivaj backup-procezoj de ĉi tiu GitHub-deponejo estos haltigitaj, kaj ĈIUJ ĝiaj backup-job-registradoj estos forigitaj el Redis, sendepende de stato, aĝo aŭ monujo. Datumoj jam publikigitaj ĉe Arweave kaj jam senditaj blokĉenaj transakcioj NE estos forigitaj. Ĉu daŭrigi?',
         'confirm-start-new-backup-yes': 'Jes, komenci novan',
         'confirm-start-new-backup-no': 'Ne, nuligi',
 

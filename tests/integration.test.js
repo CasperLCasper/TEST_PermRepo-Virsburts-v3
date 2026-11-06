@@ -144,7 +144,11 @@ test('I17 — state machine atļauj blockchain-finalizing → manifest-uploaded'
 test('I18 — withJobLock nodod lockSignal un lockToken (S01)', () => {
   const start = backupSource.indexOf('async function withJobLock(jobId, fn) {');
   assert.ok(start >= 0, 'Nav atrasta withJobLock funkcija.');
-  const lockFn = backupSource.slice(start, start + 3000);
+  // Read the complete top-level function instead of relying on a fixed
+  // character limit that can truncate the lockToken assertion target.
+  const end = backupSource.indexOf('\n}\n', start);
+  assert.ok(end >= 0, 'Nav atrasta withJobLock funkcijas beigu robeža.');
+  const lockFn = backupSource.slice(start, end + 2);
   assert.match(lockFn, /lockLostController\.abort/, 'Lock zaudēšana neizsauc abort.');
   assert.match(lockFn, /lockSignal:\s*lockLostController\.signal/, 'fn() nesaņem lockSignal.');
   assert.match(lockFn, /lockToken:\s*token/, 'fn() nesaņem lockToken.');

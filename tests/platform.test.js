@@ -343,7 +343,7 @@ test('P19 — withJobLock atceļ darbu, kad lock tiek zaudēts (S01)', () => {
 
   assert.ok(start >= 0, 'Nav atrasta withJobLock funkcija.');
 
-  const lockFn = source.slice(start, start + 3000);
+  const lockFn = source.slice(start, start + 4500);
 
   assert.match(lockFn, /lockLostController\.abort/);
   assert.match(lockFn, /lockSignal:\s*lockLostController\.signal/);
@@ -449,35 +449,146 @@ test('P27 — galvenā lapa atrod nepabeigtu backup Redis arī bez localStorage 
   assert.match(app, /jobStatus\.zipTxId \|\| jobStatus\.manifestTxId \|\| jobStatus\.backupTxHash/, 'Nepabeigts backup netiek atpazīts pēc ZIP/manifesta/transakcijas kontrolpunkta.');
 });
 
-// ✅ Jauns tests: REQUIRE_ANS104_LOCATION vides mainīgais
-test('P28 — REQUIRE_ANS104_LOCATION vides mainīgais kontrolē ANS-104 pārbaudi (devnet/mainnet)', () => {
+// Chain-aware ANS-104 signature verification: skip signature only on devnet.
+test('P28 — ANS-104 paraksta pārbaude ir ieslēgta Base mainnet, bet struktūra un ID/data binding vienmēr obligāti', () => {
+  const server = read('server.js');
+  const verifier = server.slice(server.indexOf('async function verifyArweaveDataItem('), server.indexOf('async function loadPreviousManifest('));
+
+  assert.match(server, /BigInt\(CHAIN_ID\) === 8453n/);
+  assert.match(verifier, /DataItem\.verify\(rawItem\)/);
+  assert.match(verifier, /item\.id !== manifestId/);
+  assert.match(verifier, /Buffer\.from\(item\.rawData\)\.equals\(manifestBytes\)/);
+  assert.match(verifier, /if \(VERIFY_ANS104_SIGNATURES && !\(await item\.isValid\(\)\)\)/);
+  assert.doesNotMatch(verifier, /return false/);
+  assert.match(server, /verifyAns104Signatures: VERIFY_ANS104_SIGNATURES/);
+});
+
+test('P29 — avārijas dzēšana skenē visus repo job un pārbauda, ka atlikumu nav', () => {
+  const redis = read('accounting-redis.js');
+  const server = read('server.js');
+  const app = read('src/App.jsx');
+
+  assert.match(redis, /export async function deleteJobsForRepository/);
+  assert.match(redis, /client\.scan\(cursor,\s*\{\s*match,\s*count:\s*250\s*\}\)/);
+  assert.match(redis, /getJobRepositoryId\(job\) !== repoId/);
+  assert.match(redis, /remainingCount !== 0/);
+  assert.match(redis, /remainingIndexCount !== 0/);
+  assert.match(redis, /remainingLockCount !== 0/);
+  assert.match(redis, /client\.mget\(\.\.\.batch\)/);
+  assert.match(server, /app\.post\('\/api\/delete-repository-jobs'/);
+  assert.match(server, /repoData\.permissions\?\.admin/);
+  const purgeRoute = server.slice(server.indexOf("app.post('/api/delete-repository-jobs'"), server.indexOf("app.post('/api/delete-job'"));
+  assert.match(purgeRoute, /extendRepositoryOperationLock\(repositoryId, operationLockToken\)/);
+  assert.match(purgeRoute, /requestRepositoryCancellation\(repositoryId, 900\)/);
+  assert.match(purgeRoute, /acquireEmergencyRepositoryOperationLock\(repositoryId\)/);
+  assert.match(purgeRoute, /stopDeadline/);
+  assert.match(purgeRoute, /clearRepositoryCancellation\(repositoryId\)/);
+  assert.match(redis, /export async function isRepositoryCancellationRequested/);
+  assert.match(redis, /export async function requestRepositoryCancellation/);
+  assert.match(app, /\/api\/delete-repository-jobs/);
+  assert.match(app, /deletion\.remainingIndexCount/);
+  assert.match(app, /deletion\.remainingLockCount/);
+});
+
+test('P30 — backup sagatavošana izmanto repo un wallet atomiskās slēdzenes', () => {
+  const redis = read('accounting-redis.js');
   const server = read('server.js');
 
-  // Vides mainīgā definīcija
-  assert.match(
-    server,
-    /REQUIRE_ANS104_LOCATION\s*=\s*process\.env\.REQUIRE_ANS104_LOCATION\s*===\s*['"]true['"]/,
-    'Trūkst REQUIRE_ANS104_LOCATION vides mainīgā definīcijas.'
-  );
+  assert.match(redis, /export async function acquireRepositoryOperationLock/);
+  assert.match(redis, /export async function acquireRepositoryLock/);
+  assert.match(redis, /CREATE_JOB_WITH_REPOSITORY_LOCK_LUA/);
+  assert.match(redis, /currentOperationLock ~= ARGV\[3\]/);
+  assert.match(redis, /currentWalletLock ~= ARGV\[4\]/);
+  assert.match(server, /acquireRepositoryOperationLock\(id\)/);
+  assert.match(server, /acquireRepositoryLock\(githubUserId, id, normalizedWallet\)/);
+  assert.match(server, /repositoryOperationLockToken,/);
+  assert.match(server, /repositoryLockToken,/);
+  assert.match(server, /extendRepositoryOperationLock\(id, repositoryOperationLockToken\)/);
+  const jobLock = server.slice(server.indexOf('async function withJobLock'), server.indexOf('// Encrypt session records'));
+  assert.match(jobLock, /acquireRepositoryOperationLock\(repositoryId\)/);
+  assert.match(jobLock, /extendRepositoryOperationLock\(repositoryId, repositoryOperationLockToken\)/);
+});
 
-  // Pārbaude verifyArweaveDataItem iekšpusē — ja false, atgriež false, nevis met kļūdu
-  assert.match(
-    server,
-    /if\s*\(!REQUIRE_ANS104_LOCATION\)\s*\{[\s\S]*?return false;/,
-    'Trūkst REQUIRE_ANS104_LOCATION pārbaudes verifyArweaveDataItem iekšpusē.'
-  );
+test('P31 — GitHub ZIP pagaidu fails tiek glabāts privātā direktorijā ar 0600 režīmu', () => {
+  const server = read('server.js');
+  assert.match(server, /fs\.promises\.mkdtemp\(path\.join\(os\.tmpdir\(\), 'permrepo-'\)\)/);
+  assert.match(server, /fs\.promises\.chmod\(tempDir, 0o700\)/);
+  assert.match(server, /createWriteStream\(tempPath, \{ flags: 'wx', mode: 0o600 \}\)/);
+  assert.match(server, /fs\.promises\.chmod\(tempPath, 0o600\)/);
+  assert.match(server, /fs\.promises\.rm\(archive\.tempDir, \{ recursive: true, force: true \}\)/);
+});
 
-  // Pārbaude loadPreviousManifest iekšpusē — pārbauda atgriezto vērtību
-  assert.match(
-    server,
-    /ans104Verified\s*===\s*false/,
-    'Trūkst ans104Verified atgrieztās vērtības pārbaudes loadPreviousManifest iekšpusē.'
-  );
+test('P32 — nederīga manifesta history aptur inkrementālo backup un netiek aizstāta ar tukšu masīvu', () => {
+  const server = read('server.js');
+  const client = read('src/BackupPage.jsx');
+  assert.match(server, /manifest\.history !== undefined/);
+  assert.match(server, /Manifesta history nav masīvs/);
+  assert.match(client, /function validateManifestHistory\(history\)/);
+  assert.match(client, /const validatedHistory = validateManifestHistory/);
+  assert.match(client, /backup turpināts netiks, lai nepazaudētu vēsturi/);
+  assert.match(client, /if \(!manifestResponse\.ok\)/);
+  assert.match(client, /Number\(jobStatus\.backupCount \|\| 0\) > 0/);
+  assert.match(client, /Number\(metadata\.backupCount \|\| 0\) > 0/);
+});
 
-  // Brīdinājuma ziņojums, kad pārbaude izlaista
-  assert.match(
-    server,
-    /ANS-104 datu vienuma verifikācija izlaista/,
-    'Trūkst brīdinājuma ziņojuma, kad ANS-104 pārbaude tiek izlaista.'
-  );
+test('P33 — Standard Backup izmanto GitHub noklusējuma zaru, nevis klienta norādītu zaru', () => {
+  const server = read('server.js');
+  assert.match(server, /githubToken, repoData\.ownerLogin, repoName,\s*repoData\.defaultBranch/);
+  assert.doesNotMatch(server, /req\.body\.defaultBranch \|\| repoData\.defaultBranch/);
+});
+
+test('P34 — lockfile darbplūsma sagatavo pārskatāmu PR, nevis commit uz main', () => {
+  const workflow = read('.github/workflows/update-lock.yml');
+  assert.match(workflow, /pull-requests: write/);
+  assert.match(workflow, /git switch -c/);
+  assert.match(workflow, /gh pr create/);
+  assert.doesNotMatch(workflow, /git push\s*$/m);
+});
+
+test('P35 — NFT minting nav abonementa; abonements tiek pārbaudīts backup darbībai', () => {
+  const app = read('src/App.jsx');
+  const server = read('server.js');
+  const mintStart = app.indexOf('const mintNFT = useCallback');
+  const mintEnd = app.indexOf('const createBackup = useCallback', mintStart);
+  const mintHandler = app.slice(mintStart, mintEnd);
+  const prepareStart = server.indexOf("app.post('/api/prepare-backup'");
+  const prepareEnd = server.indexOf("app.post('/api/", prepareStart + 20);
+  const prepareRoute = server.slice(prepareStart, prepareEnd);
+
+  assert.doesNotMatch(mintHandler, /subscriptionStatus|subscription-required/);
+  assert.match(app, /mint-no-subscription-needed/);
+  assert.match(app, /onClick=\{\(\) => mintNFT\(selectedRepo\.name\)\}/);
+  assert.match(prepareRoute, /verifySubscription|isSubscribed|subscription/i);
+});
+
+test('P36 — GitHub OAuth sesijas Redis tiek šifrētas ar AES-256-GCM un vecie ieraksti migrēti', () => {
+  const server = read('server.js');
+  const codec = read('session-crypto.js');
+  assert.match(server, /createSessionRecordCodec\(SESSION_SECRET\)/);
+  assert.match(codec, /crypto\.hkdfSync\(\s*'sha256'/);
+  assert.match(codec, /createCipheriv\('aes-256-gcm'/);
+  assert.match(codec, /createDecipheriv\('aes-256-gcm'/);
+  assert.match(codec, /SESSION_ENVELOPE_FORMAT/);
+  assert.match(server, /if \(decoded\.legacyPlaintext\)/);
+  assert.match(server, /encryptSessionRecord\(decoded\.sessionData\)/);
+});
+
+test('P37 — avārijas dzēšana ir pieejama arī arhivētam repo, ja lietotājam ir admin tiesības', () => {
+  const server = read('server.js');
+  assert.match(server, /async function getGitHubRepositoryById\(githubToken, repositoryId, options = \{\}\)/);
+  assert.match(server, /data\.archived && options\.allowArchived !== true/);
+  assert.match(server, /getGitHubRepositoryById\(req\.session\.githubToken, numericRepositoryId, \{ allowArchived: true \}\)/);
+});
+
+test('P38 — server pārbauda manifesta history nepārtrauktību pret iepriekšējo manifestu', () => {
+  const server = read('server.js');
+  assert.match(server, /previousManifestHistory: Array\.isArray\(previousManifest\?\.history\)/);
+  assert.match(server, /async function validateManifestHistoryContinuity/);
+  assert.match(server, /stableJson\(preservedEntry\) !== stableJson\(previousEntry\)/);
+  assert.match(server, /manifestHistory\.length !== expectedIds\.size/);
+  const routeStart = server.indexOf("app.post('/api/save-manifest-tx'");
+  const routeEnd = server.indexOf("app.post('/api/", routeStart + 20);
+  const route = server.slice(routeStart, routeEnd);
+  assert.ok(route.indexOf('verifyJobAuthorization') < route.indexOf('validateManifestHistoryContinuity'));
+  assert.match(route, /validateManifestHistoryContinuity\(manifest, job\)/);
 });

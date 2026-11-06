@@ -397,10 +397,8 @@ function App() {
     }, [config, apiJson, t]);
 
     const mintNFT = useCallback(async (repoName) => {
-        if (!subscriptionStatus?.isSubscribed) {
-            setError(t('subscription-required'));
-            return;
-        }
+        // NFT minting is allowed without a subscription. Subscription checks
+        // apply to backup creation only.
         try {
             setIsLoading(true);
             setStatus(t('mint-preparing'));
@@ -452,7 +450,7 @@ function App() {
                 setError(e.message || t('mint-authorization-failed'));
             }
         }
-    }, [config, userAddress, connectWallet, subscriptionStatus, t, apiJson, reposData]);
+    }, [config, userAddress, connectWallet, t, apiJson, reposData]);
 
     const createBackup = useCallback(async (repo) => {
         if (!window.ethereum || !userAddress) {
@@ -514,23 +512,31 @@ function App() {
 
         const repoKey = repo.id != null ? String(repo.id) : repo.name;
         try {
-            const oldJobId = localStorage.getItem(`permrepo-job-${repoKey}`);
-            if (oldJobId) {
-                try {
-                    await apiJson('/api/delete-job', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ jobId: oldJobId })
-                    });
-                } catch (deleteError) {
-                    console.warn('Neizdevās dzēst job:', deleteError);
-                }
+            const deletion = await apiJson('/api/delete-repository-jobs', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ repositoryId: String(repo.id) })
+            });
+
+            if (!deletion?.success || Number(deletion.remainingCount) !== 0 || Number(deletion.remainingIndexCount) !== 0 || Number(deletion.remainingLockCount) !== 0) {
+                throw new Error(deletion?.error || 'Neizdevās apstiprināt visu šī repozitorija backup job dzēšanu.');
             }
 
+        } catch (deleteError) {
+            console.error('Neizdevās pilnībā izdzēst repozitorija backup job:', deleteError);
+            setError(getSafeErrorMessage(deleteError, t));
+            return;
+        }
+
+        // Clear browser recovery pointers only after the server confirms that
+        // every Redis job for this repository has been removed.
+        try {
             localStorage.removeItem(`permrepo-job-${repoKey}`);
             localStorage.removeItem(`permrepo-backup-tx-${repoKey}`);
             localStorage.removeItem(`permrepo-recovery-${repoKey}`);
-        } catch {}
+        } catch (storageError) {
+            console.warn('Neizdevās notīrīt lokālos recovery pointerus:', storageError);
+        }
 
         setUnfinishedBackup(null);
         navigate(`/backup?repo=${encodeURIComponent(repo.name)}&repoId=${repo.id}&repoFullName=${encodeURIComponent(repo.full_name)}`, {
@@ -829,20 +835,25 @@ function App() {
                                 <div style={{ textAlign: 'center', padding: '20px' }}>
                                     <div className="spinner"></div>
                                 </div>
-                            ) : !subscriptionStatus?.isSubscribed ? (
-                                <div className="error">
-                                    <Icon name="kluda" />
-                                    {t('subscription-required')}
-                                </div>
                             ) : selectedRepo.hasNFT && selectedRepo.nftOwnedByWallet ? (
-                                hasUnfinishedBackup ? null : (
-                                    <button 
-                                        onClick={() => startNewBackupFromMain(selectedRepo)}
-                                        className="sign-button start-new-backup-btn"
-                                    >
-                                        {t('start-new-backup')}
-                                    </button>
-                                )
+                                <>
+                                    {!subscriptionStatus?.isSubscribed && !hasUnfinishedBackup && (
+                                        <div className="error">
+                                            <Icon name="kluda" />
+                                            {t('subscription-required')}
+                                        </div>
+                                    )}
+                                    {hasUnfinishedBackup ? null : (
+                                        <button
+                                            onClick={() => startNewBackupFromMain(selectedRepo)}
+                                            className="sign-button start-new-backup-btn"
+                                            disabled={!subscriptionStatus?.isSubscribed || isLoading}
+                                            title={!subscriptionStatus?.isSubscribed ? t('subscription-required') : undefined}
+                                        >
+                                            {t('start-new-backup')}
+                                        </button>
+                                    )}
+                                </>
                             ) : selectedRepo.hasNFT && !selectedRepo.nftOwnedByWallet ? (
                                 <div className="error">
                                     <Icon name="kluda" />
@@ -853,12 +864,19 @@ function App() {
                                     <div className="spinner"></div>
                                 </div>
                             ) : (
-                                <button 
-                                    onClick={() => mintNFT(selectedRepo.name)}
-                                    className="sign-button"
-                                >
-                                    {t('mint-nft')}
-                                </button>
+                                <>
+                                    {!subscriptionStatus?.isSubscribed && (
+                                        <div className="info">
+                                            {t('mint-no-subscription-needed')}
+                                        </div>
+                                    )}
+                                    <button
+                                        onClick={() => mintNFT(selectedRepo.name)}
+                                        className="sign-button"
+                                    >
+                                        {t('mint-nft')}
+                                    </button>
+                                </>
                             )}
                         </div>
                     )}

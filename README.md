@@ -159,12 +159,15 @@ node server.js
 | `UPSTASH_REDIS_REST_URL` | Upstash Redis URL |
 | `UPSTASH_REDIS_REST_TOKEN` | Upstash Redis Token |
 | `CHAIN_ID` | Base ķēdes ID |
-| `RPC_URL` | Base RPC URL |
+| `RPC_URL` | Primary Base RPC URL |
+| `RPC_FALLBACK_URLS` | Optional comma-separated fallback RPC endpoints |
+| `TX_CONFIRMATIONS` | Minimum canonical block confirmations before backup completion |
 | `NFT_ADDRESS` | PermRepoNFT kontrakta adrese |
 | `SUBSCRIPTION_ADDRESS` | Subscription kontrakta adrese |
 | `USDC_ADDRESS` | USDC kontrakta adrese |
 | `MINT_AUTHORIZATION_SIGNER_PRIVATE_KEY` | Backend maka privātā atslēga |
-| `ARWEAVE_GATEWAY` | Arweave gateway URL |
+| `ARWEAVE_GATEWAY` | Primary Arweave gateway URL |
+| `AR_IO_GATEWAY` | Secondary AR.IO gateway for ANS-104 verification/fallback reads |
 | `TURBO_UPLOAD_URL` | Turbo upload URL |
 | `TURBO_PAYMENT_URL` | Turbo payment URL |
 
@@ -401,6 +404,8 @@ node server.js
 ~~~
 
 **Environment Variables** (See `.env.example` for full list)
+
+**Session upgrade note:** plaintext legacy Redis sessions are no longer accepted. After deploying this version, users with an old session must sign in to GitHub again; new sessions are encrypted with AES-256-GCM.
 
 | Variable | Description |
 |----------|-------------|

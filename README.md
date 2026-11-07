@@ -167,6 +167,8 @@ node server.js
 | `USDC_ADDRESS` | USDC kontrakta adrese |
 | `MINT_AUTHORIZATION_SIGNER_PRIVATE_KEY` | Backend maka privātā atslēga |
 | `ARWEAVE_GATEWAY` | Primary Arweave gateway URL |
+| `AR_IO_GATEWAY` | AR.IO gateway URL used for ANS-104 verification (devnet: `https://ar-io.dev`) |
+| `REQUIRE_ANS104_LOCATION` | `true` (default) requires ANS-104 location metadata; `false` permits loading when location metadata is unavailable, with reduced raw-item verification |
 | `AR_IO_GATEWAY` | Secondary AR.IO gateway for ANS-104 verification/fallback reads |
 | `TURBO_UPLOAD_URL` | Turbo upload URL |
 | `TURBO_PAYMENT_URL` | Turbo payment URL |
@@ -760,3 +762,6 @@ Copyright (c) 2026 Virsburts PermRepo
 - **Arweave:** https://arweave.org
 - **Turbo:** https://ardrive.io/turbo
 - **ARIO:** https://ar.io
+
+
+**ANS-104 location requirement:** `REQUIRE_ANS104_LOCATION` accepts only `true` or `false` (case-insensitive). If unset or blank, it defaults to `true`. With `true`, manifest loading stops if the configured AR.IO gateway cannot provide a valid root transaction ID, byte offset, and item size. With `false`, manifest loading may continue when those location fields are unavailable. This fallback cannot perform the raw ANS-104 byte-range verification (including cryptographic binding of the data-item ID to the returned bytes); it still rejects a response-ID mismatch when the gateway supplies that header, and the manifest JSON structure/schema validation remains mandatory. Use `false` only when you accept this reduced verification on a devnet gateway. It does not switch gateways or alter the configured devnet environment.

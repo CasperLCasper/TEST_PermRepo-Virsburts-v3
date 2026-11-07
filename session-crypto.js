@@ -33,22 +33,36 @@ export function createSessionRecordCodec(sessionSecret) {
             ? storedValue
             : JSON.parse(String(storedValue));
 
-        // Backward compatibility: migrate old plaintext Redis sessions on read.
-        if (parsed?.format !== SESSION_ENVELOPE_FORMAT) {
-            return { sessionData: parsed, legacyPlaintext: true };
+        // Never interpret an unknown or plaintext Redis record as a legacy
+        // session. A writable Redis attacker must not be able to inject an
+        // authenticated-looking plaintext session.
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) ||
+            parsed.format !== SESSION_ENVELOPE_FORMAT) {
+            throw new Error('Redis session ieraksta formāts nav atbalstīts; nepieciešama atkārtota autorizācija.');
         }
 
-        const iv = Buffer.from(String(parsed.iv || ''), 'base64');
-        const tag = Buffer.from(String(parsed.tag || ''), 'base64');
-        const ciphertext = Buffer.from(String(parsed.data || ''), 'base64');
-        if (iv.length !== 12 || tag.length !== 16 || ciphertext.length === 0) {
+        const isBase64 = value => typeof value === 'string' &&
+            /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value);
+        if (!isBase64(parsed.iv) || !isBase64(parsed.tag) || !isBase64(parsed.data)) {
+            throw new Error('Redis session šifrētā ieraksta Base64 lauki nav derīgi.');
+        }
+        const iv = Buffer.from(parsed.iv, 'base64');
+        const tag = Buffer.from(parsed.tag, 'base64');
+        const ciphertext = Buffer.from(parsed.data, 'base64');
+        if (iv.length !== 12 || tag.length !== 16 || ciphertext.length === 0 ||
+            iv.toString('base64') !== parsed.iv || tag.toString('base64') !== parsed.tag ||
+            ciphertext.toString('base64') !== parsed.data) {
             throw new Error('Redis session šifrētais ieraksts ir bojāts.');
         }
 
         const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
         decipher.setAuthTag(tag);
         const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-        return { sessionData: JSON.parse(plaintext.toString('utf8')), legacyPlaintext: false };
+        const sessionData = JSON.parse(plaintext.toString('utf8'));
+        if (!sessionData || typeof sessionData !== 'object' || Array.isArray(sessionData)) {
+            throw new Error('Redis session saturs nav derīgs objekts.');
+        }
+        return { sessionData, legacyPlaintext: false };
     }
 
     return { encryptSessionRecord, decryptSessionRecord };

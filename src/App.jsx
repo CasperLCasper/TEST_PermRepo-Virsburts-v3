@@ -515,7 +515,7 @@ function App() {
             const deletion = await apiJson('/api/delete-repository-jobs', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ repositoryId: String(repo.id) })
+                body: JSON.stringify({ repositoryId: String(repo.id), walletAddress: userAddress, tokenId: String(repo.tokenId) })
             });
 
             if (!deletion?.success || Number(deletion.remainingCount) !== 0 || Number(deletion.remainingIndexCount) !== 0 || Number(deletion.remainingLockCount) !== 0) {

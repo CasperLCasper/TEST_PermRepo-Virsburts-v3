@@ -339,7 +339,7 @@ test('P18 — iepriekšējais manifests tiek ielādēts caur konfigurēto vārte
 
 test('P19 — withJobLock atceļ darbu, kad lock tiek zaudēts (S01)', () => {
   const source = read('server.js');
-  const start = source.indexOf('async function withJobLock(jobId, fn) {');
+  const start = source.indexOf('async function withJobLock(jobId, req, fn) {');
 
   assert.ok(start >= 0, 'Nav atrasta withJobLock funkcija.');
 
@@ -460,7 +460,7 @@ test('P28 — ANS-104 paraksta pārbaude ir ieslēgta Base mainnet, bet struktū
   assert.match(verifier, /Buffer\.from\(item\.rawData\)\.equals\(manifestBytes\)/);
   assert.match(verifier, /if \(VERIFY_ANS104_SIGNATURES && !\(await item\.isValid\(\)\)\)/);
   assert.doesNotMatch(verifier, /return false/);
-  assert.match(server, /verifyAns104Signatures: VERIFY_ANS104_SIGNATURES/);
+  assert.match(server, /Verify ANS-104 signatures/);
 });
 
 test('P29 — avārijas dzēšana skenē visus repo job un pārbauda, ka atlikumu nav', () => {
@@ -561,7 +561,7 @@ test('P35 — NFT minting nav abonementa; abonements tiek pārbaudīts backup da
   assert.match(prepareRoute, /verifySubscription|isSubscribed|subscription/i);
 });
 
-test('P36 — GitHub OAuth sesijas Redis tiek šifrētas ar AES-256-GCM un vecie ieraksti migrēti', () => {
+test('P36 — GitHub OAuth sesijas Redis tiek šifrētas ar AES-256-GCM un legacy plaintext tiek noraidīts', () => {
   const server = read('server.js');
   const codec = read('session-crypto.js');
   assert.match(server, /createSessionRecordCodec\(SESSION_SECRET\)/);
@@ -569,8 +569,8 @@ test('P36 — GitHub OAuth sesijas Redis tiek šifrētas ar AES-256-GCM un vecie
   assert.match(codec, /createCipheriv\('aes-256-gcm'/);
   assert.match(codec, /createDecipheriv\('aes-256-gcm'/);
   assert.match(codec, /SESSION_ENVELOPE_FORMAT/);
-  assert.match(server, /if \(decoded\.legacyPlaintext\)/);
-  assert.match(server, /encryptSessionRecord\(decoded\.sessionData\)/);
+  assert.match(codec, /parsed\.format !== SESSION_ENVELOPE_FORMAT/);
+  assert.match(server, /callback\(null, null\)/);
 });
 
 test('P37 — avārijas dzēšana ir pieejama arī arhivētam repo, ja lietotājam ir admin tiesības', () => {
@@ -591,4 +591,82 @@ test('P38 — server pārbauda manifesta history nepārtrauktību pret iepriekš
   const route = server.slice(routeStart, routeEnd);
   assert.ok(route.indexOf('verifyJobAuthorization') < route.indexOf('validateManifestHistoryContinuity'));
   assert.match(route, /validateManifestHistoryContinuity\(manifest, job\)/);
+});
+
+
+test('P39 — job autorizācija tiek pārbaudīta pirms repository operation lock iegūšanas', () => {
+  const server = read('server.js');
+  const start = server.indexOf('async function withJobLock(jobId, req, fn)');
+  const end = server.indexOf('// Encrypt session records', start);
+  const fn = server.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.ok(fn.indexOf('await verifyJobAuthorization(req, initialJob)') < fn.indexOf('acquireRepositoryOperationLock(repositoryId)'));
+  assert.match(fn, /releaseRepositoryOperationLock\(repositoryId, repositoryOperationLockToken\)/);
+});
+
+test('P40 — prepare-backup atbrīvo repo slēdzeni ar to pašu tokenu un kanonisku repo ID', () => {
+  const server = read('server.js');
+  const start = server.indexOf("app.post('/api/prepare-backup'");
+  const end = server.indexOf('// Redis-first recovery lookup', start);
+  const route = server.slice(start, end);
+  assert.match(route, /normalizeRepositoryId\(req\.body\?\.repositoryId\), repositoryOperationLockToken\)/);
+});
+
+test('P41 — manifests tiek pilnībā salīdzināts ar changed un unchanged job failiem', () => {
+  const server = read('server.js');
+  assert.match(server, /Manifesta paths ieraksts nesakrīt ar changedFileMetadata/);
+  assert.match(server, /Manifesta paths ieraksts nesakrīt ar unchangedFiles/);
+  assert.match(server, /manifesta paths nesakrīt ar job changedFileMetadata un unchangedFiles/i);
+  assert.match(server, /Dzēstais fails kļūdaini atrodas manifestā/);
+});
+
+test('P42 — blockchain finalizācija pirms addBackup veic Arweave read-after-write pārbaudi', () => {
+  const server = read('server.js');
+  assert.match(server, /async function verifyPublishedManifest/);
+  assert.match(server, /await verifyPublishedManifest\(job\.manifestTxId, job\.manifest\)/);
+  assert.match(server, /neatkarīgi nolasāms un pārbaudāms Arweave vārtejās/i);
+});
+
+test('P43 — repository purge prasa pašreizējā NFT īpašnieka autorizāciju un aizsargā neatrisinātas transakcijas', () => {
+  const server = read('server.js');
+  const redis = read('accounting-redis.js');
+  const app = read('src/App.jsx');
+  const routeStart = server.indexOf("app.post('/api/delete-repository-jobs'");
+  const routeEnd = server.indexOf("app.post('/api/delete-job'", routeStart);
+  const route = server.slice(routeStart, routeEnd);
+  assert.match(route, /nftContract\.ownerOf\(BigInt\(requestedTokenId\)\)/);
+  assert.match(app, /walletAddress: userAddress, tokenId: String\(repo\.tokenId\)/);
+  assert.match(redis, /Job NFT tokenId does not match/);
+  assert.match(redis, /job\.backupTxHash && job\.status !== 'completed'/);
+});
+
+test('P44 — sesiju logout atsauc GitHub tokenu un nezināmi API GET maršruti saņem JSON 404', () => {
+  const server = read('server.js');
+  assert.match(server, /applications\/\$\{encodeURIComponent\(GITHUB_CLIENT_ID\)\}\/token/);
+  assert.match(server, /app\.get\('\/api\/\*'/);
+  assert.match(server, /Pieprasījumam trūkst Origin vai Referer galvenes/);
+});
+
+
+test('P45 — prepare-backup pārbauda GitHub, abonementu un NFT pirms repo lock', () => {
+  const server = read('server.js');
+  const start = server.indexOf("app.post('/api/prepare-backup'");
+  const end = server.indexOf('// Redis-first recovery lookup', start);
+  const route = server.slice(start, end);
+  const auth = route.indexOf('getGitHubRepositoryById(githubToken, id)');
+  const subscription = route.indexOf('verifySubscription(githubUserId)');
+  const nft = route.indexOf('nftContract.ownerOf(tokenId)');
+  const lock = route.indexOf('acquireRepositoryOperationLock(id)');
+  assert.ok(auth >= 0 && subscription > auth && nft > subscription && lock > nft);
+});
+
+
+test('P46 — blockchain receipt tiek pārbaudīts pret apstiprinājumu skaitu un kanonisko bloku', () => {
+  const server = read('server.js');
+  assert.match(server, /const RPC_FALLBACK_URLS =/);
+  assert.match(server, /new ethers\.FallbackProvider\(providers, EXPECTED_CHAIN_ID, 1\)/);
+  assert.match(server, /async function assertReceiptFinality/);
+  assert.match(server, /confirmations < TX_CONFIRMATIONS/);
+  assert.match(server, /canonicalBlock\.hash/);
+  assert.match(server, /await assertReceiptFinality\(provider, receipt\)/);
 });

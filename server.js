@@ -18,6 +18,7 @@ import { normalizeRepositoryId } from './repository-id.js';
 import { ethers } from 'ethers';
 import yauzl from 'yauzl';
 import { DataItem } from '@dha-team/arbundles';
+import { parseRequireAns104Location } from './ans104-location-config.js';
 
 import {
     initRedis,
@@ -55,6 +56,9 @@ app.set('trust proxy', 1);
 const PORT = Number(process.env.PORT || 3000);
 const ARWEAVE_GATEWAY = process.env.ARWEAVE_GATEWAY || '';
 const AR_IO_GATEWAY = process.env.AR_IO_GATEWAY || 'https://ar-io.dev';
+// Location metadata is required by default. Set false only for devnet gateways
+// that cannot expose ANS-104 offsets/headers.
+const REQUIRE_ANS104_LOCATION = parseRequireAns104Location(process.env.REQUIRE_ANS104_LOCATION);
 const CHAIN_ID = process.env.CHAIN_ID || '';
 const RPC_URL = process.env.RPC_URL || '';
 const RPC_FALLBACK_URLS = (process.env.RPC_FALLBACK_URLS || '').split(',').map(value => value.trim()).filter(Boolean);
@@ -723,7 +727,18 @@ async function verifyArweaveDataItem(response, manifestBytes, manifestId, fetchI
             try { await headResponse?.body?.cancel(); } catch {}
         }
         if (!location) {
-            throw new Error(`Vārteja nesniedza derīgu ANS-104 atrašanās vietu: offsets (${offsetsError || 'atrašanās vieta nav indeksēta'}) un HEAD /raw galvenes nav pietiekamas.`);
+            const locationError = `Vārteja nesniedza derīgu ANS-104 atrašanās vietu: offsets (${offsetsError || 'atrašanās vieta nav indeksēta'}) un HEAD /raw galvenes nav pietiekamas.`;
+            if (REQUIRE_ANS104_LOCATION) {
+                throw new Error(locationError);
+            }
+
+            // Without root transaction/offset/size, raw ANS-104 byte-range
+            // verification (including cryptographic item-ID/data binding) is
+            // impossible. Continue only when explicitly configured. A supplied
+            // response-ID mismatch is still rejected above; manifest JSON and
+            // schema validation remain mandatory in loadPreviousManifest().
+            console.warn(`⚠️ REQUIRE_ANS104_LOCATION=false: ${locationError} Turpinu bez raw ANS-104 byte-range pārbaudes; manifesta JSON un shēmas pārbaudes paliek obligātas.`);
+            return true;
         }
     }
 
@@ -4426,6 +4441,7 @@ app.listen(PORT, () => {
     logInfo('Lock heartbeat', `${LOCK_HEARTBEAT_MS}ms`);
     logInfo('Job TTL', `${JOB_TTL_SECONDS}s (${JOB_TTL_SECONDS / 3600}h)`);
     logInfo('Verify ANS-104 signatures', VERIFY_ANS104_SIGNATURES ? '✅ JĀ (Base mainnet)' : '⚠️ NĒ (devnet; structural and ID/data checks remain enabled)');
+    logInfo('Require ANS-104 location', REQUIRE_ANS104_LOCATION ? 'JĀ (obligāta)' : 'NĒ (atļauts turpināt bez location; raw item pārbaude var nebūt iespējama)');
     logInfo('Redis', '✅ IR');
     logInfo('RPC', RPC_URL);
     logInfo('NFT', NFT_ADDRESS || '❌ NAV');

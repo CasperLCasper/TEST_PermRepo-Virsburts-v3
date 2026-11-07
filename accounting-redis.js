@@ -6,6 +6,8 @@
 
 import { Redis } from '@upstash/redis';
 import crypto from 'crypto';
+import { normalizeRepositoryId } from './repository-id.js';
+export { normalizeRepositoryId } from './repository-id.js';
 
 let redis = null;
 
@@ -37,7 +39,7 @@ function repositoryLockKey(githubUserId, repositoryId, walletAddress) {
 
 function validateRepositoryLockIdentity(githubUserId, repositoryId, walletAddress) {
     const userId = String(githubUserId || '');
-    const repoId = String(repositoryId || '');
+    const repoId = normalizeRepositoryId(repositoryId);
     const wallet = String(walletAddress || '').toLowerCase();
     if (!/^\d+$/.test(userId) || !/^\d+$/.test(repoId) || !/^0x[0-9a-f]{40}$/.test(wallet)) {
         throw new Error('Nederīgi repozitorija bloķēšanas parametri.');
@@ -122,7 +124,7 @@ function getJobRepositoryId(job) {
     if (repositoryId === undefined || repositoryId === null || !/^\d+$/.test(String(repositoryId))) {
         throw new Error('Redis job ierakstā nav derīga GitHub repo ID; avārijas dzēšanu nevar droši apstiprināt.');
     }
-    return String(repositoryId);
+    return normalizeRepositoryId(repositoryId);
 }
 
 function jobOwnerLookupKey(job) {
@@ -139,8 +141,8 @@ function jobOwnerLookupKey(job) {
 }
 
 export async function acquireRepositoryOperationLock(repositoryId, ttlSeconds = 600) {
-    const repoId = String(repositoryId || '');
-    if (!/^\d+$/.test(repoId)) throw new Error('Nederīgs GitHub repo ID bloķēšanai.');
+    const repoId = normalizeRepositoryId(repositoryId);
+    if (!repoId) throw new Error('Nederīgs GitHub repo ID bloķēšanai.');
     const client = requireRedis();
     const token = crypto.randomUUID();
     const result = await client.eval(`
@@ -153,8 +155,7 @@ export async function acquireRepositoryOperationLock(repositoryId, ttlSeconds = 
 // Cancellation is a durable repo-scoped fence: new operations are rejected,
 // while existing lock heartbeats observe it and terminate their work.
 export async function requestRepositoryCancellation(repositoryId, ttlSeconds = 900) {
-    const repoId = String(repositoryId || '');
-    if (!/^\d+$/.test(repoId)) throw new Error('Nederīgs GitHub repo ID atcelšanai.');
+    const repoId = normalizeRepositoryId(repositoryId);
     const token = crypto.randomUUID();
     const client = requireRedis();
     await client.set(repositoryCancellationKey(repoId), token, { ex: ttlSeconds });
@@ -162,32 +163,30 @@ export async function requestRepositoryCancellation(repositoryId, ttlSeconds = 9
 }
 
 export async function isRepositoryCancellationRequested(repositoryId) {
-    const repoId = String(repositoryId || '');
-    if (!/^\d+$/.test(repoId)) throw new Error('Nederīgs GitHub repo ID atcelšanas pārbaudei.');
+    const repoId = normalizeRepositoryId(repositoryId);
     return Boolean(await requireRedis().get(repositoryCancellationKey(repoId)));
 }
 
 export async function clearRepositoryCancellation(repositoryId) {
-    const repoId = String(repositoryId || '');
-    if (!/^\d+$/.test(repoId)) throw new Error('Nederīgs GitHub repo ID atcelšanas dzēšanai.');
+    const repoId = normalizeRepositoryId(repositoryId);
     await requireRedis().del(repositoryCancellationKey(repoId));
 }
 
 export async function acquireEmergencyRepositoryOperationLock(repositoryId, ttlSeconds = 600) {
-    const repoId = String(repositoryId || '');
-    if (!/^\d+$/.test(repoId)) throw new Error('Nederīgs GitHub repo ID bloķēšanai.');
+    const repoId = normalizeRepositoryId(repositoryId);
+    if (!repoId) throw new Error('Nederīgs GitHub repo ID bloķēšanai.');
     return acquireRedisLock(repositoryOperationLockKey(repoId), ttlSeconds);
 }
 
 export async function extendRepositoryOperationLock(repositoryId, token, ttlSeconds = 600) {
-    const repoId = String(repositoryId || '');
-    if (!/^\d+$/.test(repoId)) throw new Error('Nederīgs GitHub repo ID bloķēšanai.');
+    const repoId = normalizeRepositoryId(repositoryId);
+    if (!repoId) throw new Error('Nederīgs GitHub repo ID bloķēšanai.');
     return extendRedisLock(repositoryOperationLockKey(repoId), token, ttlSeconds);
 }
 
 export async function releaseRepositoryOperationLock(repositoryId, token) {
-    const repoId = String(repositoryId || '');
-    if (!/^\d+$/.test(repoId)) throw new Error('Nederīgs GitHub repo ID bloķēšanai.');
+    const repoId = normalizeRepositoryId(repositoryId);
+    if (!repoId) throw new Error('Nederīgs GitHub repo ID bloķēšanai.');
     return releaseRedisLock(repositoryOperationLockKey(repoId), token);
 }
 
@@ -299,12 +298,15 @@ export async function deleteJob(jobId) {
  * The repository ID is globally unique; wallet and job status are deliberately
  * not used as filters.
  */
-export async function deleteJobsForRepository(repositoryId, operationLockToken) {
+export async function deleteJobsForRepository(repositoryId, expectedTokenId, operationLockToken, resolvePendingTransaction = null) {
     const client = requireRedis();
-    const repoId = String(repositoryId || '');
-    if (!/^\d+$/.test(repoId)) throw new Error('Nederīgs GitHub repo ID avārijas dzēšanai.');
+    const repoId = normalizeRepositoryId(repositoryId);
     if (typeof operationLockToken !== 'string' || !operationLockToken) {
         throw new Error('Avārijas dzēšanai nav repo operation lock token.');
+    }
+    const expectedToken = String(expectedTokenId ?? '');
+    if (!/^\d+$/.test(expectedToken) || BigInt(expectedToken) <= 0n) {
+        throw new Error('Avārijas dzēšanai nav derīga NFT token ID.');
     }
 
     const assertOperationLock = async () => {
@@ -320,7 +322,10 @@ export async function deleteJobsForRepository(repositoryId, operationLockToken) 
             .filter(key => key.startsWith('permrepo:job:'));
         let deletedCount = 0;
         const relatedJobLockKeys = new Set();
+        const orphanJobLockKeys = new Set();
         const keysToDelete = [];
+        const unresolvedRecords = [];
+        const unresolvedTransactions = [];
 
         // Read job records in bounded MGET batches to avoid thousands of
         // sequential Redis round trips during a repository-wide purge.
@@ -332,8 +337,39 @@ export async function deleteJobsForRepository(repositoryId, operationLockToken) 
                 const key = batch[i];
                 const jobId = key.slice('permrepo:job:'.length);
                 if (!/^[a-f0-9-]{20,100}$/i.test(jobId)) continue;
-                const job = parseJobRecord(rawJobs[i]);
-                if (!job || getJobRepositoryId(job) !== repoId) continue;
+                let job;
+                try {
+                    job = parseJobRecord(rawJobs[i]);
+                    if (!job) continue;
+                    if (getJobRepositoryId(job) !== repoId) continue;
+                } catch (parseError) {
+                    unresolvedRecords.push({ key, reason: parseError?.message || 'Malformed job record' });
+                    continue;
+                }
+
+                if (String(job.tokenId ?? '') !== expectedToken) {
+                    unresolvedRecords.push({ key, reason: 'Job NFT tokenId does not match the authorized repository NFT.' });
+                    continue;
+                }
+                if (job.backupTxHash && job.status !== 'completed') {
+                    let resolutionError = null;
+                    if (typeof resolvePendingTransaction === 'function') {
+                        try {
+                            const resolvedJob = await resolvePendingTransaction(job, jobId);
+                            if (resolvedJob) job = resolvedJob;
+                        } catch (error) {
+                            resolutionError = error?.message || String(error);
+                        }
+                    }
+                    if (job.backupTxHash && job.status !== 'completed') {
+                        unresolvedTransactions.push({
+                            jobId,
+                            backupTxHash: String(job.backupTxHash),
+                            reason: resolutionError || 'Transakcijas receipt nav apstiprināts vai termiņš vēl nav beidzies.'
+                        });
+                        continue;
+                    }
+                }
 
                 const lockKey = jobLockKey(jobId);
                 relatedJobLockKeys.add(lockKey);
@@ -344,6 +380,11 @@ export async function deleteJobsForRepository(repositoryId, operationLockToken) 
             }
         }
         await assertOperationLock();
+        if (unresolvedTransactions.length > 0) {
+            const hashes = unresolvedTransactions.map(item => item.backupTxHash);
+            const reasons = unresolvedTransactions.slice(0, 3).map(item => `${item.jobId}: ${item.reason}`).join(' | ');
+            throw new Error(`Dzēšana apturēta: ${unresolvedTransactions.length} job ir neatrisināta blockchain transakcija. Vispirms atver backup atkopšanu un pabeidz vai atjauno transakciju (${hashes.slice(0, 3).join(', ')}). ${reasons}`);
+        }
         await deleteKeysInBatches(client, [...new Set(keysToDelete)]);
 
         // Remove stale owner indexes and the per-wallet repository locks too.
@@ -354,12 +395,13 @@ export async function deleteJobsForRepository(repositoryId, operationLockToken) 
             const indexedJobIds = await client.mget(...batch);
             for (const indexedJobId of indexedJobIds) {
                 if (typeof indexedJobId === 'string' && /^[a-f0-9-]{20,100}$/i.test(indexedJobId)) {
-                    const lockKey = jobLockKey(indexedJobId);
-                    relatedJobLockKeys.add(lockKey);
+                    orphanJobLockKeys.add(jobLockKey(indexedJobId));
                 }
             }
         }
-        await deleteKeysInBatches(client, staleOwnerKeys);
+        // Owner indexes for matched jobs are already included in keysToDelete.
+        // Orphan indexes cannot be safely attributed to an NFT/job, so leave
+        // them in place and let the final verification report incomplete purge.
         await deleteKeysInBatches(client, [...relatedJobLockKeys]);
 
         await assertOperationLock();
@@ -375,16 +417,20 @@ export async function deleteJobsForRepository(repositoryId, operationLockToken) 
         for (let index = 0; index < remainingKeys.length; index += 100) {
             const batch = remainingKeys.slice(index, index + 100);
             const rawJobs = await client.mget(...batch);
-            for (const rawJob of rawJobs) {
-                const job = parseJobRecord(rawJob);
-                if (job && getJobRepositoryId(job) === repoId) remainingCount += 1;
+            for (let i = 0; i < rawJobs.length; i += 1) {
+                try {
+                    const job = parseJobRecord(rawJobs[i]);
+                    if (job && getJobRepositoryId(job) === repoId) remainingCount += 1;
+                } catch (parseError) {
+                    unresolvedRecords.push({ key: batch[i], reason: parseError?.message || 'Malformed job record' });
+                }
             }
         }
 
         const remainingOwnerKeys = await scanKeys(client, `permrepo:job-owner:*:${repoId}:*`);
         const remainingRepositoryLocks = await scanKeys(client, `permrepo:repository-lock:*:${repoId}:*`);
         let remainingJobLockCount = 0;
-        const relatedLockList = [...relatedJobLockKeys];
+        const relatedLockList = [...new Set([...relatedJobLockKeys, ...orphanJobLockKeys])];
         for (let index = 0; index < relatedLockList.length; index += 100) {
             const batch = relatedLockList.slice(index, index + 100);
             const values = await client.mget(...batch);
@@ -394,10 +440,11 @@ export async function deleteJobsForRepository(repositoryId, operationLockToken) 
         const remainingLockCount = remainingRepositoryLocks.length + remainingJobLockCount;
         await assertOperationLock();
 
-        if (remainingCount !== 0 || remainingIndexCount !== 0 || remainingLockCount !== 0) {
-            throw new Error(`Avārijas dzēšana nav pilnīga: job=${remainingCount}, indeksi=${remainingIndexCount}, bloķēšanas atslēgas=${remainingLockCount}.`);
+        if (remainingCount !== 0 || remainingIndexCount !== 0 || remainingLockCount !== 0 || unresolvedRecords.length !== 0) {
+            const examples = unresolvedRecords.slice(0, 5).map(item => item.key).join(', ');
+            throw new Error(`Avārijas dzēšana nav pilnīga: job=${remainingCount}, indeksi=${remainingIndexCount}, bloķēšanas atslēgas=${remainingLockCount}, neatpazīti ieraksti=${unresolvedRecords.length}. Neatpazītos Redis ierakstus nevar droši piesaistīt repozitorijam. Atslēgas: ${examples || 'nav'}.`);
         }
-        return { deletedCount, remainingCount, remainingIndexCount, remainingLockCount };
+        return { deletedCount, remainingCount, remainingIndexCount, remainingLockCount, unresolvedRecordCount: 0 };
     } catch (error) {
         console.error('Redis repozitorija avārijas dzēšana neizdevās:', error);
         throw new Error(`Neizdevās pilnībā izdzēst repozitorija backup job: ${error?.message || error}`);
@@ -473,7 +520,8 @@ const VALID_TRANSITIONS = {
         'prepared',
         'zip-uploaded',
         'manifest-uploading',
-        'manifest-uploaded'
+        'manifest-uploaded',
+        'completed' // atļauts tikai recovery ceļā pēc on-chain receipt/event pārbaudes
     ]
 };
 

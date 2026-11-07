@@ -13,6 +13,8 @@ import crypto from 'crypto';
 import session from 'express-session';
 import { createSessionRecordCodec } from './session-crypto.js';
 import rateLimit from 'express-rate-limit';
+import { UpstashRateLimitStore } from './redis-rate-limit-store.js';
+import { normalizeRepositoryId } from './repository-id.js';
 import { ethers } from 'ethers';
 import yauzl from 'yauzl';
 import { DataItem } from '@dha-team/arbundles';
@@ -55,6 +57,8 @@ const ARWEAVE_GATEWAY = process.env.ARWEAVE_GATEWAY || '';
 const AR_IO_GATEWAY = process.env.AR_IO_GATEWAY || 'https://ar-io.dev';
 const CHAIN_ID = process.env.CHAIN_ID || '';
 const RPC_URL = process.env.RPC_URL || '';
+const RPC_FALLBACK_URLS = (process.env.RPC_FALLBACK_URLS || '').split(',').map(value => value.trim()).filter(Boolean);
+const TX_CONFIRMATIONS = Number(process.env.TX_CONFIRMATIONS || 1);
 const NFT_ADDRESS = process.env.NFT_ADDRESS || '';
 const SUBSCRIPTION_ADDRESS = process.env.SUBSCRIPTION_ADDRESS || '';
 const USDC_ADDRESS = process.env.USDC_ADDRESS || '';
@@ -494,7 +498,28 @@ function calculateGitBlobSha(buffer) {
 }
 
 function getProvider() {
-    return new ethers.JsonRpcProvider(RPC_URL, EXPECTED_CHAIN_ID);
+    const urls = [...new Set([RPC_URL, ...RPC_FALLBACK_URLS].filter(Boolean))];
+    if (urls.length === 0) throw new Error('Nav konfigurēts blockchain RPC URL.');
+    const providers = urls.map(url => new ethers.JsonRpcProvider(url, EXPECTED_CHAIN_ID));
+    return providers.length === 1
+        ? providers[0]
+        : new ethers.FallbackProvider(providers, EXPECTED_CHAIN_ID, 1);
+}
+
+async function assertReceiptFinality(provider, receipt) {
+    if (!Number.isSafeInteger(TX_CONFIRMATIONS) || TX_CONFIRMATIONS < 1) {
+        throw new Error('TX_CONFIRMATIONS konfigurācija nav derīga.');
+    }
+    const latestBlockNumber = await provider.getBlockNumber();
+    const confirmations = latestBlockNumber - Number(receipt.blockNumber) + 1;
+    if (!Number.isSafeInteger(confirmations) || confirmations < TX_CONFIRMATIONS) {
+        throw new Error(`Blockchain transakcija vēl nav sasniegusi prasīto apstiprinājumu skaitu (${Math.max(0, confirmations)}/${TX_CONFIRMATIONS}).`);
+    }
+    const canonicalBlock = await provider.getBlock(receipt.blockNumber);
+    if (!canonicalBlock?.hash || canonicalBlock.hash.toLowerCase() !== String(receipt.blockHash || '').toLowerCase()) {
+        throw new Error('Blockchain transakcijas bloks vairs nav kanoniskajā ķēdē.');
+    }
+    return confirmations;
 }
 
 const mintAuthorizationSigner = new ethers.Wallet(
@@ -854,18 +879,18 @@ function throwIfLockLost(signal) {
     }
 }
 
-async function withJobLock(jobId, fn) {
-    // Acquire the repository operation gate before the per-job lock. This
-    // serializes every mutating job route with emergency repository purges.
+async function withJobLock(jobId, req, fn) {
+    // Authorize the caller before acquiring any repository-wide lock, then
+    // serialize the authorised mutation with emergency repository purges.
     const initialJob = await getJob(jobId);
     if (!initialJob) throw new Error('Backup job nav atrasts.');
 
-    const repositoryId = String(
+    const repositoryId = normalizeRepositoryId(
         initialJob.githubRepositoryId ?? initialJob.repositoryId ?? initialJob.repoId ?? ''
     );
-    if (!/^\d+$/.test(repositoryId)) {
-        throw new Error('Backup job nesatur derīgu GitHub repo ID.');
-    }
+
+    // Reject unauthorised job IDs before acquiring a repository-wide lock.
+    await verifyJobAuthorization(req, initialJob);
 
     const repositoryOperationLockToken = await acquireRepositoryOperationLock(repositoryId);
     if (!repositoryOperationLockToken) {
@@ -881,7 +906,7 @@ async function withJobLock(jobId, fn) {
     try {
         const currentJob = await getJob(jobId);
         if (!currentJob) throw new Error('Backup job tika dzēsts pirms darbības sākuma.');
-        const currentRepositoryId = String(
+        const currentRepositoryId = normalizeRepositoryId(
             currentJob.githubRepositoryId ?? currentJob.repositoryId ?? currentJob.repoId ?? ''
         );
         if (currentRepositoryId !== repositoryId) {
@@ -956,16 +981,15 @@ class UpstashSessionStore extends session.Store {
             .then(async value => {
                 if (!value) return callback(null, null);
                 const decoded = decryptSessionRecord(value);
-                if (decoded.legacyPlaintext) {
-                    await this.redis.set(
-                        this.key(sid),
-                        encryptSessionRecord(decoded.sessionData),
-                        { ex: this.ttlSeconds }
-                    );
-                }
                 return callback(null, decoded.sessionData);
             })
-            .catch(error => callback(error));
+            .catch(async error => {
+                console.warn('Redis session nav derīga; pieprasīta atkārtota autorizācija:', error?.message || error);
+                try { await this.redis.del(this.key(sid)); } catch (deleteError) {
+                    console.error('Nederīgas Redis session dzēšana neizdevās:', deleteError?.message || deleteError);
+                }
+                callback(null, null);
+            });
     }
 
     set(sid, sess, callback = () => {}) {
@@ -1045,6 +1069,7 @@ app.use(session({
 }));
 
 const githubApiLimiter = rateLimit({
+    store: new UpstashRateLimitStore(redisClient, 'permrepo:ratelimit:github', 60 * 1000),
     windowMs: 60 * 1000,
     max: 30,
     standardHeaders: true,
@@ -1054,6 +1079,7 @@ const githubApiLimiter = rateLimit({
 });
 
 const backupLimiter = rateLimit({
+    store: new UpstashRateLimitStore(redisClient, 'permrepo:ratelimit:backup', 60 * 1000),
     windowMs: 60 * 1000,
     max: 10,
     standardHeaders: true,
@@ -1063,6 +1089,7 @@ const backupLimiter = rateLimit({
 });
 
 const mintAuthorizationLimiter = rateLimit({
+    store: new UpstashRateLimitStore(redisClient, 'permrepo:ratelimit:mint', 60 * 1000),
     windowMs: 60 * 1000,
     max: 10,
     standardHeaders: true,
@@ -1586,16 +1613,17 @@ function assertSameOrigin(req) {
             if (refererOrigin !== expected) {
                 throw new Error('Nederīgs pieprasījuma referer.');
             }
+            return;
         } catch (error) {
-            if (
-                error instanceof Error &&
-                error.message === 'Nederīgs pieprasījuma referer.'
-            ) {
-                throw error;
-            }
+            if (error instanceof Error && error.message === 'Nederīgs pieprasījuma referer.') throw error;
             throw new Error('Nederīgs pieprasījuma referer.');
         }
     }
+
+    // OAuth login is a safe GET navigation; state/nonce still protects callback.
+    // All state-changing requests must prove their same-origin browser context.
+    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return;
+    throw new Error('Pieprasījumam trūkst Origin vai Referer galvenes.');
 }
 
 function validateJobTxInput(jobId, txId) {
@@ -1977,6 +2005,31 @@ app.post('/api/github/logout', async (req, res) => {
     try {
         assertSameOrigin(req);
 
+        const githubToken = req.session?.githubToken;
+        let githubTokenRevoked = false;
+        if (githubToken && GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET) {
+            try {
+                const revokeResponse = await fetch(
+                    `https://api.github.com/applications/${encodeURIComponent(GITHUB_CLIENT_ID)}/token`,
+                    {
+                        method: 'DELETE',
+                        signal: AbortSignal.timeout(10000),
+                        headers: {
+                            Authorization: `Basic ${Buffer.from(`${GITHUB_CLIENT_ID}:${GITHUB_CLIENT_SECRET}`).toString('base64')}`,
+                            Accept: 'application/vnd.github+json',
+                            'Content-Type': 'application/json',
+                            'X-GitHub-Api-Version': '2022-11-28'
+                        },
+                        body: JSON.stringify({ access_token: githubToken })
+                    }
+                );
+                githubTokenRevoked = revokeResponse.ok || revokeResponse.status === 404;
+                if (!githubTokenRevoked) console.error(`GitHub token revocation failed with HTTP ${revokeResponse.status}.`);
+            } catch (revokeError) {
+                console.error('GitHub token revocation request failed:', revokeError?.message || revokeError);
+            }
+        }
+
         await new Promise((resolve, reject) => {
             req.session.destroy(error => {
                 if (error) {
@@ -1989,7 +2042,7 @@ app.post('/api/github/logout', async (req, res) => {
 
         res.clearCookie('connect.sid');
 
-        return res.json({ success: true });
+        return res.json({ success: true, githubTokenRevoked });
     } catch (error) {
         return res.status(500).json({
             success: false,
@@ -2299,7 +2352,10 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
         const githubToken = req.session.githubToken;
         const githubUser = req.session.githubUser;
         const githubUserId = String(req.session.githubUserId);
-        const id = Number(repositoryId);
+        let canonicalRepositoryId;
+        try { canonicalRepositoryId = normalizeRepositoryId(repositoryId); }
+        catch { canonicalRepositoryId = null; }
+        const id = canonicalRepositoryId ? Number(canonicalRepositoryId) : NaN;
         const normalizedWallet = safeWallet(walletAddress);
 
         if (!Number.isSafeInteger(id) || id <= 0) {
@@ -2312,6 +2368,43 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
                 error: 'Nederīga maka adrese.'
             });
         }
+        // Perform all expensive authorization checks before taking a global
+        // repository lock. A caller without GitHub/NFT/subscription rights must
+        // not be able to occupy the repository gate.
+        const repoData = await getGitHubRepositoryById(githubToken, id);
+        if (!repoData.permissions || (!repoData.permissions.admin && !repoData.permissions.push)) {
+            return res.status(403).json({ success: false, error: 'Tev nav tiesību uz šo repozitoriju.' });
+        }
+        const fullRepoName = repoData.fullName;
+        const repoName = fullRepoName.split('/')[1];
+        await verifySubscription(githubUserId);
+
+        const provider = getProvider();
+        const nftContract = new ethers.Contract(NFT_ADDRESS, NFT_ABI, provider);
+        const repoHash = repositoryHash(id);
+        const tokenId = await nftContract.repositoryTokens(repoHash);
+        if (tokenId === 0n) {
+            return res.status(400).json({ success: false, error: 'Šim repozitorijam nav PermRepo NFT.' });
+        }
+        const nftOwner = await nftContract.ownerOf(tokenId);
+        if (nftOwner.toLowerCase() !== normalizedWallet.toLowerCase()) {
+            return res.status(403).json({ success: false, error: 'Savienotajam makam nepieder šī repozitorija NFT.' });
+        }
+
+        if (requestedRecoveryJobId != null && !validateJobId(requestedRecoveryJobId)) {
+            return res.status(400).json({ success: false, error: 'Nederīgs atkopšanas job ID.' });
+        }
+        if (requestedRecoveryJobId) {
+            const existingRecoveryJob = await getJob(requestedRecoveryJobId);
+            if (existingRecoveryJob) {
+                await verifyJobAuthorization(req, existingRecoveryJob);
+                if (String(existingRecoveryJob.githubRepositoryId) !== String(id) ||
+                    String(existingRecoveryJob.walletAddress).toLowerCase() !== normalizedWallet.toLowerCase()) {
+                    return res.status(403).json({ success: false, error: 'Atkopšanas job neatbilst šim repozitorijam vai makam.' });
+                }
+            }
+        }
+
         if (await isRepositoryCancellationRequested(id)) {
             return res.status(409).json({ success: false, error: 'Šim repozitorijam tiek pārtraukts iepriekšējais backup process. Mēģini vēlreiz pēc dzēšanas.' });
         }
@@ -2363,40 +2456,16 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
         }, LOCK_HEARTBEAT_MS);
         repositoryLockHeartbeat.unref();
 
-        const repoData = await getGitHubRepositoryById(githubToken, id);
-        if (!repoData.permissions || (!repoData.permissions.admin && !repoData.permissions.push)) {
-            return res.status(403).json({ success: false, error: 'Tev nav tiesību uz šo repozitoriju.' });
-        }
-        const fullRepoName = repoData.fullName;
-        const repoName = fullRepoName.split('/')[1];
-
         logSection('📥 PREPARE BACKUP');
         logInfo('Repo', fullRepoName);
         logInfo('GitHub repo ID', String(id));
         logInfo('GitHub user ID', githubUserId);
         logInfo('Wallet', normalizedWallet);
 
-        await verifySubscription(githubUserId);
-
-        const provider = getProvider();
-        const nftContract = new ethers.Contract(NFT_ADDRESS, NFT_ABI, provider);
-        const repoHash = repositoryHash(id);
-        const tokenId = await nftContract.repositoryTokens(repoHash);
-
-        if (tokenId === 0n) {
-            return res.status(400).json({
-                success: false,
-                error: 'Šim repozitorijam nav PermRepo NFT.'
-            });
-        }
-
-        const nftOwner = await nftContract.ownerOf(tokenId);
-
-        if (nftOwner.toLowerCase() !== normalizedWallet.toLowerCase()) {
-            return res.status(403).json({
-                success: false,
-                error: 'Savienotajam makam nepieder šī repozitorija NFT.'
-            });
+        // Recheck NFT ownership after taking the lock to close the preflight/lock race.
+        const lockedNftOwner = await nftContract.ownerOf(tokenId);
+        if (lockedNftOwner.toLowerCase() !== normalizedWallet.toLowerCase()) {
+            throw new Error('Savienotajam makam vairs nepieder šī repozitorija NFT.');
         }
 
         const [backupCount, lastManifest, lastMerkleRoot] = await Promise.all([
@@ -2447,9 +2516,6 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
         }
 
         const reservationBytes = backupResourceController.estimateMemoryBytes(maxFileBytes);
-        if (requestedRecoveryJobId != null && !validateJobId(requestedRecoveryJobId)) {
-            return res.status(400).json({ success: false, error: 'Nederīgs atkopšanas job ID.' });
-        }
         let jobId = requestedRecoveryJobId || crypto.randomUUID();
         if (requestedRecoveryJobId) {
             const existingRecoveryJob = await getJob(requestedRecoveryJobId);
@@ -2758,13 +2824,13 @@ app.post('/api/prepare-backup', backupLimiter, async (req, res) => {
         if (repositoryLockToken) {
             await releaseRepositoryLock(
                 String(req.session?.githubUserId || ''),
-                String(req.body?.repositoryId || ''),
+                normalizeRepositoryId(req.body?.repositoryId),
                 String(req.body?.walletAddress || '').toLowerCase(),
                 repositoryLockToken
             ).catch(error => console.error('Repo wallet lock atbrīvošana neizdevās:', error));
         }
         if (repositoryOperationLockToken) {
-            await releaseRepositoryOperationLock(String(req.body?.repositoryId || ''))
+            await releaseRepositoryOperationLock(normalizeRepositoryId(req.body?.repositoryId), repositoryOperationLockToken)
                 .catch(error => console.error('Repo operation lock atbrīvošana neizdevās:', error));
         }
 
@@ -2919,7 +2985,7 @@ app.post('/api/start-zip-upload', backupLimiter, async (req, res) => {
             });
         }
 
-        return await withJobLock(jobId, async ({ lockSignal, lockToken }) => {
+        return await withJobLock(jobId, req, async ({ lockSignal, lockToken }) => {
             throwIfLockLost(lockSignal);
 
             const job = await getJob(jobId);
@@ -3014,7 +3080,7 @@ app.post('/api/save-zip-tx', backupLimiter, async (req, res) => {
             normalizedMerkleRoot = merkleRoot;
         }
 
-        return await withJobLock(jobId, async ({ lockSignal, lockToken }) => {
+        return await withJobLock(jobId, req, async ({ lockSignal, lockToken }) => {
             throwIfLockLost(lockSignal);
 
             const job = await getJob(jobId);
@@ -3153,7 +3219,7 @@ app.post('/api/start-manifest-upload', backupLimiter, async (req, res) => {
             });
         }
 
-        return await withJobLock(jobId, async ({ lockSignal, lockToken }) => {
+        return await withJobLock(jobId, req, async ({ lockSignal, lockToken }) => {
             throwIfLockLost(lockSignal);
 
             const job = await getJob(jobId);
@@ -3204,7 +3270,7 @@ app.post('/api/save-manifest-tx', backupLimiter, async (req, res) => {
         validateJobTxInput(jobId, manifestTxId);
         validateManifest(manifest);
 
-        return await withJobLock(jobId, async ({ lockSignal, lockToken }) => {
+        return await withJobLock(jobId, req, async ({ lockSignal, lockToken }) => {
             throwIfLockLost(lockSignal);
 
             const job = await getJob(jobId);
@@ -3261,16 +3327,72 @@ app.post('/api/save-manifest-tx', backupLimiter, async (req, res) => {
                 throw new Error('Manifesta deletedFiles nesakrīt ar rezerves kopijas darba dzēsto failu sarakstu.');
             }
 
-            const changedPaths = new Set((job.changedFileMetadata || []).map(f => f.path));
-            const containsPaths = new Set(manifest.archive.contains.map(e => e.path));
-            for (const changedPath of changedPaths) {
-                if (!containsPaths.has(changedPath)) {
-                    throw new Error(`Manifesta archive.contains trūkst ZIP faila: ${changedPath}`);
+            const changedFiles = Array.isArray(job.changedFileMetadata) ? job.changedFileMetadata : [];
+            const unchangedFiles = job.unchangedFiles && typeof job.unchangedFiles === 'object'
+                ? job.unchangedFiles
+                : {};
+            const changedPaths = new Set();
+            const expectedManifestPaths = new Set();
+            const containsPaths = new Set(manifest.archive.contains.map(entry => entry.path));
+
+            for (const file of changedFiles) {
+                if (!file || typeof file.path !== 'string' || typeof file.hash !== 'string' ||
+                    !/^[0-9a-fA-F]{64}$/.test(file.hash) || changedPaths.has(file.path)) {
+                    throw new Error('Backup job changedFileMetadata satur nederīgus vai dublētus failu ierakstus.');
                 }
-                const pathInfo = manifest.paths[changedPath];
+                changedPaths.add(file.path);
+                expectedManifestPaths.add(file.path);
+                if (!containsPaths.has(file.path)) {
+                    throw new Error(`Manifesta archive.contains trūkst ZIP faila: ${file.path}`);
+                }
+                const pathInfo = manifest.paths[file.path];
                 const pathZipId = pathInfo && (pathInfo.zipId || pathInfo.id);
-                if (pathZipId !== job.zipTxId) {
-                    throw new Error(`Manifesta faila ${changedPath} ZIP ID nesakrīt ar pašreizējā darba ZIP transakciju.`);
+                if (!pathInfo || pathInfo.hash?.toLowerCase() !== file.hash.toLowerCase() || pathZipId !== job.zipTxId) {
+                    throw new Error(`Manifesta paths ieraksts nesakrīt ar changedFileMetadata: ${file.path}`);
+                }
+            }
+
+            for (const [filePath, fileInfo] of Object.entries(unchangedFiles)) {
+                if (changedPaths.has(filePath) || !fileInfo || !validateArweaveId(fileInfo.id) ||
+                    typeof fileInfo.hash !== 'string' || !/^[0-9a-fA-F]{64}$/.test(fileInfo.hash)) {
+                    throw new Error(`Backup job unchangedFiles ieraksts nav derīgs: ${filePath}`);
+                }
+                expectedManifestPaths.add(filePath);
+                const pathInfo = manifest.paths[filePath];
+                const pathZipId = pathInfo && (pathInfo.zipId || pathInfo.id);
+                if (!pathInfo || pathInfo.hash?.toLowerCase() !== fileInfo.hash.toLowerCase() || pathZipId !== fileInfo.id) {
+                    throw new Error(`Manifesta paths ieraksts nesakrīt ar unchangedFiles: ${filePath}`);
+                }
+            }
+
+            // Deletion-only backups may include this reserved marker in the ZIP.
+            const deletionMarkerPath = '__permrepo_deletions__.json';
+            if (containsPaths.has(deletionMarkerPath)) {
+                const markerInfo = manifest.paths[deletionMarkerPath];
+                const markerEntry = manifest.archive.contains.find(entry => entry.path === deletionMarkerPath);
+                if (!markerInfo || !markerEntry || markerInfo.hash?.toLowerCase() !== markerEntry.hash.toLowerCase() ||
+                    (markerInfo.zipId || markerInfo.id) !== job.zipTxId) {
+                    throw new Error('Manifesta dzēšanas marķiera ieraksts nav sasaistīts ar pašreizējo ZIP.');
+                }
+                expectedManifestPaths.add(deletionMarkerPath);
+            }
+
+            for (const entry of manifest.archive.contains) {
+                if (!changedPaths.has(entry.path) && entry.path !== deletionMarkerPath) {
+                    throw new Error(`Manifesta archive.contains satur failu, kas nav pašreizējā job changedFileMetadata: ${entry.path}`);
+                }
+            }
+
+            const actualManifestPaths = Object.keys(manifest.paths).sort();
+            const expectedPaths = [...expectedManifestPaths].sort();
+            if (JSON.stringify(actualManifestPaths) !== JSON.stringify(expectedPaths)) {
+                throw new Error('Manifesta paths nesakrīt ar job changedFileMetadata un unchangedFiles; ir izlaisti vai pievienoti failu ieraksti.');
+            }
+
+            const deletedPathSet = new Set(jobDeletedFiles);
+            for (const deletedPath of deletedPathSet) {
+                if (expectedManifestPaths.has(deletedPath)) {
+                    throw new Error(`Dzēstais fails kļūdaini atrodas manifestā: ${deletedPath}`);
                 }
             }
 
@@ -3361,6 +3483,48 @@ app.post('/api/save-manifest-tx', backupLimiter, async (req, res) => {
     }
 });
 
+// Verify the just-uploaded manifest through Arweave before permitting the
+// on-chain addBackup transaction. Temporary gateway/RPC failures leave the job
+// recoverable; they do not mark it as failed.
+async function verifyPublishedManifest(manifestId, expectedManifest) {
+    const gateways = [...new Set([ARWEAVE_GATEWAY, AR_IO_GATEWAY].filter(Boolean))];
+    if (gateways.length === 0) throw new Error('Nav konfigurēta Arweave vārteja manifesta pārbaudei.');
+    let lastError = null;
+    for (const gateway of gateways) {
+        try {
+            const url = getValidatedManifestUrl(manifestId, gateway);
+            const response = await fetchWithRetry(url, {
+                cache: 'no-store',
+                redirect: 'follow',
+                signal: AbortSignal.timeout(60000),
+                headers: { 'User-Agent': 'PermRepo/1.0', Accept: 'application/json' }
+            }, 3, 'Augšupielādētā manifesta pārbaude');
+            if (!response.ok) throw new Error(`Arweave vārteja atbildēja ar HTTP ${response.status}.`);
+            const bytes = await readResponseBytesWithLimit(response, MAX_MANIFEST_BYTES, 'Augšupielādētais manifests');
+            await verifyArweaveDataItem(response, bytes, manifestId, fetch, gateway);
+            let published;
+            try { published = JSON.parse(bytes.toString('utf8')); }
+            catch { throw new Error('Arweave atdotais manifests nav derīgs JSON.'); }
+            validateManifest(published);
+            const canonical = value => {
+                if (Array.isArray(value)) return value.map(canonical);
+                if (value && typeof value === 'object') {
+                    return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])]));
+                }
+                return value;
+            };
+            if (JSON.stringify(canonical(published)) !== JSON.stringify(canonical(expectedManifest))) {
+                throw new Error('Arweave vārtejas atdotais manifesta saturs nesakrīt ar Redis saglabāto job manifestu.');
+            }
+            return true;
+        } catch (error) {
+            lastError = error;
+            console.warn(`Manifesta read-after-write pārbaude neizdevās (${gateway}):`, errorMessage(error));
+        }
+    }
+    throw new Error(`Manifests vēl nav neatkarīgi nolasāms un pārbaudāms Arweave vārtejās. Backup finalizācija nav sākta; mēģini atkopšanu vēlāk. Iemesls: ${lastError?.message || 'nezināma kļūda'}`);
+}
+
 // =============================================================================
 // Blockchain finalization state transitions
 // =============================================================================
@@ -3436,7 +3600,7 @@ app.post('/api/start-blockchain-finalize', backupLimiter, async (req, res) => {
             });
         }
 
-        return await withJobLock(jobId, async ({ lockSignal, lockToken }) => {
+        return await withJobLock(jobId, req, async ({ lockSignal, lockToken }) => {
             throwIfLockLost(lockSignal);
 
             const job = await getJob(jobId);
@@ -3486,6 +3650,9 @@ app.post('/api/start-blockchain-finalize', backupLimiter, async (req, res) => {
             if (expectedManifestHash.toLowerCase() !== manifestHash.toLowerCase()) {
                 throw new Error('Manifest hash nesakrīt ar manifest URI.');
             }
+
+            await verifyPublishedManifest(job.manifestTxId, job.manifest);
+            throwIfLockLost(lockSignal);
 
             const provider = getProvider();
             const nftContract = new ethers.Contract(NFT_ADDRESS, NFT_ABI, provider);
@@ -3539,7 +3706,7 @@ app.post('/api/reopen-blockchain-finalize', backupLimiter, async (req, res) => {
             return res.status(400).json({ success: false, error: 'Nederīgs job ID.' });
         }
 
-        return await withJobLock(jobId, async ({ lockSignal, lockToken }) => {
+        return await withJobLock(jobId, req, async ({ lockSignal, lockToken }) => {
             const job = await getJob(jobId);
             const wallet = await verifyJobAuthorization(req, job);
             await verifyJobNFTAuthorization({ ...job, walletAddress: wallet });
@@ -3603,7 +3770,7 @@ app.post('/api/save-backup-tx', backupLimiter, async (req, res) => {
             });
         }
 
-        return await withJobLock(jobId, async ({ lockSignal, lockToken }) => {
+        return await withJobLock(jobId, req, async ({ lockSignal, lockToken }) => {
             throwIfLockLost(lockSignal);
 
             const job = await getJob(jobId);
@@ -3681,7 +3848,7 @@ app.post('/api/complete-backup', backupLimiter, async (req, res) => {
             });
         }
 
-        return await withJobLock(jobId, async ({ lockSignal, lockToken }) => {
+        return await withJobLock(jobId, req, async ({ lockSignal, lockToken }) => {
             throwIfLockLost(lockSignal);
 
             const job = await getJob(jobId);
@@ -3709,7 +3876,9 @@ app.post('/api/complete-backup', backupLimiter, async (req, res) => {
                 );
             }
 
-            if (job.status !== 'blockchain-finalizing') {
+            const failedJobWithKnownTransaction = job.status === 'failed' &&
+                typeof job.backupTxHash === 'string' && job.backupTxHash === txHash;
+            if (job.status !== 'blockchain-finalizing' && !failedJobWithKnownTransaction) {
                 throw new Error(
                     `Nevar pabeigt backup no statusa: ${job.status}`
                 );
@@ -3734,6 +3903,8 @@ app.post('/api/complete-backup', backupLimiter, async (req, res) => {
             if (!receipt) {
                 throw new Error('Transakcija vēl nav apstiprināta.');
             }
+            await assertReceiptFinality(provider, receipt);
+            throwIfLockLost(lockSignal);
 
             if (receipt.status !== 1) {
                 throwIfLockLost(lockSignal);
@@ -3842,6 +4013,91 @@ app.post('/api/complete-backup', backupLimiter, async (req, res) => {
     }
 });
 
+async function resolvePendingPurgeTransaction(job, jobId) {
+    const txHash = String(job?.backupTxHash || '');
+    if (!validateTxHash(txHash)) throw new Error(`Job ${jobId} satur nederīgu backupTxHash; dzēšana apturēta.`);
+
+    const provider = getProvider();
+    const [receipt, transaction, latestBlock] = await Promise.all([
+        provider.getTransactionReceipt(txHash),
+        provider.getTransaction(txHash),
+        provider.getBlock('latest')
+    ]);
+
+    if (receipt) {
+        await assertReceiptFinality(provider, receipt);
+        if (receipt.to?.toLowerCase() !== NFT_ADDRESS.toLowerCase() ||
+            receipt.from?.toLowerCase() !== String(job.walletAddress || '').toLowerCase()) {
+            throw new Error(`Job ${jobId} transakcijas receipt neatbilst NFT līgumam vai job makam; dzēšana apturēta.`);
+        }
+
+        if (receipt.status === 0) {
+            return await updateJob(jobId, {
+                status: 'manifest-uploaded',
+                backupTxHash: null,
+                backupTxSubmittedAt: null,
+                retryableBlockchainFailure: true,
+                error: 'Backup transakcija blockchain tika noraidīta; Redis job var droši dzēst vai mēģināt atkārtoti.',
+                failedAt: Date.now(),
+                updatedAt: Date.now()
+            });
+        }
+        if (receipt.status !== 1) throw new Error(`Job ${jobId} transakcijas receipt status nav droši nosakāms.`);
+
+        const iface = new ethers.Interface(BACKUP_ADDED_EVENT_ABI);
+        let event = null;
+        for (const log of receipt.logs || []) {
+            if (log.address?.toLowerCase() !== NFT_ADDRESS.toLowerCase()) continue;
+            try {
+                const parsed = iface.parseLog(log);
+                if (parsed?.name === 'BackupAdded') { event = parsed; break; }
+            } catch {}
+        }
+        if (!event ||
+            event.args.tokenId.toString() !== String(job.tokenId) ||
+            event.args.backupNumber.toString() !== String(job.backupNumber) ||
+            event.args.manifestHash.toLowerCase() !== String(job.manifestHash || '').toLowerCase() ||
+            event.args.merkleRoot.toLowerCase() !== String(job.merkleRoot || '').toLowerCase() ||
+            event.args.manifestURI !== job.manifestURI) {
+            throw new Error(`Job ${jobId} receipt neapstiprina sagaidāmo BackupAdded notikumu; dzēšana apturēta.`);
+        }
+
+        return await updateJob(jobId, {
+            status: 'completed',
+            completionTxHash: txHash,
+            completedAt: Date.now(),
+            resolvedDuringRepositoryPurge: true,
+            updatedAt: Date.now()
+        });
+    }
+
+    // A transaction already included in a block must never be cleared merely
+    // because a gateway/RPC has not returned its receipt yet.
+    if (transaction?.blockNumber != null) {
+        throw new Error(`Job ${jobId} transakcija ir iekļauta blokā, bet receipt nav pieejams; dzēšana apturēta.`);
+    }
+
+    const deadline = Number(job.deadline);
+    const latestTimestamp = Number(latestBlock?.timestamp);
+    if (!Number.isSafeInteger(deadline) || deadline <= 0 ||
+        !Number.isSafeInteger(latestTimestamp) || latestTimestamp <= deadline) {
+        return null;
+    }
+
+    // The NFT contract rejects AddBackup once block.timestamp > deadline.
+    // With no receipt and no mined transaction, a still-pending tx can no
+    // longer create a successful backup and its Redis pointer can be cleared.
+    return await updateJob(jobId, {
+        status: 'manifest-uploaded',
+        backupTxHash: null,
+        backupTxSubmittedAt: null,
+        retryableBlockchainFailure: true,
+        error: 'Backup transakcijas paraksta termiņš ir beidzies; blockchain nevar pieņemt šo transakciju.',
+        failedAt: Date.now(),
+        updatedAt: Date.now()
+    });
+}
+
 // =============================================================================
 // Emergency purge — delete every Redis job belonging to the selected repo.
 // Published Arweave data and already-submitted blockchain transactions cannot
@@ -3868,6 +4124,17 @@ app.post('/api/delete-repository-jobs', backupLimiter, async (req, res) => {
                 success: false,
                 error: 'Avārijas dzēšanu drīkst veikt tikai GitHub repozitorija administrators.'
             });
+        }
+
+        const requestedWallet = safeWallet(req.body?.walletAddress);
+        const requestedTokenId = String(req.body?.tokenId ?? '');
+        if (!requestedWallet || !/^\d+$/.test(requestedTokenId) || BigInt(requestedTokenId) <= 0n) {
+            return res.status(400).json({ success: false, error: 'Avārijas dzēšanai nepieciešams derīgs NFT īpašnieka maks un token ID.' });
+        }
+        const nftContract = new ethers.Contract(NFT_ADDRESS, NFT_ABI, getProvider());
+        const nftOwner = await nftContract.ownerOf(BigInt(requestedTokenId));
+        if (nftOwner.toLowerCase() !== requestedWallet.toLowerCase()) {
+            return res.status(403).json({ success: false, error: 'Avārijas dzēšanu drīkst veikt tikai attiecīgā repozitorija NFT pašreizējais īpašnieks.' });
         }
 
         // First fence the repository: new backup/job operations are rejected,
@@ -3907,7 +4174,9 @@ app.post('/api/delete-repository-jobs', backupLimiter, async (req, res) => {
         }, LOCK_HEARTBEAT_MS);
         operationLockHeartbeat.unref();
 
-        const result = await deleteJobsForRepository(repositoryId, operationLockToken);
+        const result = await deleteJobsForRepository(
+                repositoryId, requestedTokenId, operationLockToken, resolvePendingPurgeTransaction
+            );
         if (result.remainingCount !== 0 || result.remainingIndexCount !== 0 || result.remainingLockCount !== 0) {
             return res.status(500).json({
                 success: false,
@@ -3925,7 +4194,17 @@ app.post('/api/delete-repository-jobs', backupLimiter, async (req, res) => {
         });
     } catch (error) {
         console.error('Repository emergency purge failed:', error);
-        return res.status(500).json({ success: false, error: errorMessage(error) });
+        const message = errorMessage(error);
+        if (operationLockToken && /neatrisināta blockchain transakcija/i.test(message)) {
+            // The exclusive purge lock proves current workers have stopped.
+            // Remove the cancellation fence before releasing that lock so the
+            // owner can re-enter the normal transaction-recovery endpoints.
+            await clearRepositoryCancellation(repositoryId).catch(clearError =>
+                console.error('Neizdevās noņemt cancellation fence pēc tx recovery atteikuma:', clearError)
+            );
+        }
+        const status = /neatrisināta blockchain transakcija|nevar droši|neatpazīti Redis ieraksti|token ID/i.test(message) ? 409 : 500;
+        return res.status(status).json({ success: false, error: message });
     } finally {
         operationLockHeartbeatActive = false;
         if (operationLockHeartbeat) clearInterval(operationLockHeartbeat);
@@ -3950,7 +4229,7 @@ app.post('/api/delete-job', backupLimiter, async (req, res) => {
             return res.status(400).json({ success: false, error: 'Nederīgs job ID.' });
         }
 
-        return await withJobLock(jobId, async ({ lockSignal, lockToken }) => {
+        return await withJobLock(jobId, req, async ({ lockSignal, lockToken }) => {
             throwIfLockLost(lockSignal);
             const job = await getJob(jobId);
             if (!job) {
@@ -3989,7 +4268,7 @@ app.post('/api/fail-backup', backupLimiter, async (req, res) => {
             });
         }
 
-        return await withJobLock(jobId, async ({ lockSignal, lockToken }) => {
+        return await withJobLock(jobId, req, async ({ lockSignal, lockToken }) => {
             throwIfLockLost(lockSignal);
 
             const job = await getJob(jobId);
@@ -4068,7 +4347,7 @@ app.post('/api/abandon-backup', backupLimiter, async (req, res) => {
             return res.status(400).json({ success: false, error: 'Nederīgs job ID.' });
         }
 
-        return await withJobLock(jobId, async ({ lockSignal, lockToken }) => {
+        return await withJobLock(jobId, req, async ({ lockSignal, lockToken }) => {
             throwIfLockLost(lockSignal);
             const job = await getJob(jobId);
             if (!job) {
@@ -4114,21 +4393,17 @@ app.post('/api/abandon-backup', backupLimiter, async (req, res) => {
 // =============================================================================
 
 app.get('/api/health', async (req, res) => {
-    return res.json({
-        success: true,
-        redis: Boolean(redisClient),
-        rpc: Boolean(RPC_URL),
-        nft: Boolean(NFT_ADDRESS),
-        subscription: Boolean(SUBSCRIPTION_ADDRESS),
-        github: Boolean(GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET && GITHUB_REDIRECT_URI),
-        turboUpload: Boolean(TURBO_UPLOAD_URL),
-        turboPayment: Boolean(TURBO_PAYMENT_URL),
-        mintAuthorization: Boolean(MINT_AUTHORIZATION_SIGNER_PRIVATE_KEY),
-        verifyAns104Signatures: VERIFY_ANS104_SIGNATURES
-    });
+    // Keep public health responses intentionally minimal; detailed dependency
+    // diagnostics belong in protected deployment logs/monitoring.
+    return res.json({ success: true, status: 'ok' });
 });
 
 // =============================================================================
+// Unknown API GET routes return JSON 404 instead of the frontend HTML.
+app.get('/api/*', (req, res) => {
+    return res.status(404).json({ success: false, error: 'API maršruts nav atrasts.' });
+});
+
 // Frontend fallback
 // =============================================================================
 

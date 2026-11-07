@@ -25,11 +25,9 @@ test('session record encryption rejects tampering', () => {
     assert.throws(() => codec.decryptSessionRecord(JSON.stringify(encrypted)));
 });
 
-test('session record codec identifies legacy plaintext sessions for migration', () => {
+test('session record codec rejects legacy plaintext sessions and unknown formats', () => {
     const codec = createSessionRecordCodec('test-session-secret-with-more-than-32-characters');
     const legacy = { githubToken: 'legacy-token', githubUserId: 42 };
-    assert.deepEqual(codec.decryptSessionRecord(JSON.stringify(legacy)), {
-        sessionData: legacy,
-        legacyPlaintext: true
-    });
+    assert.throws(() => codec.decryptSessionRecord(JSON.stringify(legacy)), /formāts nav atbalstīts/);
+    assert.throws(() => codec.decryptSessionRecord(JSON.stringify({ format: 'unknown-v2', data: 'x' })), /formāts nav atbalstīts/);
 });
